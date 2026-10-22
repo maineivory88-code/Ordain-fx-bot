@@ -13,7 +13,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 OANDA_API_KEY = os.environ["OANDA_API_KEY"]
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-PUBLIC_URL = os.getenv("PUBLIC_URL")          # e.g. https://your-app.onrender.com
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")# e.g. https://your-app.onrender.com
 CRON_SECRET = os.getenv("CRON_SECRET", "")    # protects /run-agent-check
 
 OANDA = "https://api-fxpractice.oanda.com/v3"
