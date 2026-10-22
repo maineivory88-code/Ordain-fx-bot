@@ -1,0 +1,5 @@
+python-telegram-bot
+requests
+v20
+fastapi
+uvicorn
