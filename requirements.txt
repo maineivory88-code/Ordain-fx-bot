@@ -3,4 +3,4 @@ requests
 v20
 fastapi
 uvicorn
-openai
+google-genai
