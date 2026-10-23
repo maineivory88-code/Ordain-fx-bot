@@ -5,22 +5,28 @@ from contextlib import asynccontextmanager
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
-from google import genai
+from openai import OpenAI
 from telegram import Bot
 
+# ---------- Environment Variables ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 OANDA_API_KEY = os.environ["OANDA_API_KEY"]
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")  # e.g. https://your-app.onrender.com
-CRON_SECRET = os.getenv("CRON_SECRET", "")  # protects /run-agent-check
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 OANDA = "https://api-fxpractice.oanda.com/v3"
 HEADERS = {"Authorization": f"Bearer {OANDA_API_KEY}", "Content-Type": "application/json"}
 
 bot = Bot(token=TELEGRAM_TOKEN)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Initialize OpenRouter Client via OpenAI compatibility layer
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 BOT_PAUSED = False
 
 
@@ -34,11 +40,11 @@ app = FastAPI(lifespan=lifespan)
 
 
 async def say(text):
-  # Plain text: no Markdown, so Gemini or external output can't break the message
+  # Send plain text so special characters in AI or market output never break Telegram parsing
   await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
 
-# ---------- OANDA helpers (blocking; run via asyncio.to_thread) ----------
+# ---------- OANDA API & ATR Helpers ----------
 def pip_size(instr): return 0.01 if "JPY" in instr else 0.0001
 def decimals(instr): return 3 if "JPY" in instr else 5
 
@@ -51,6 +57,30 @@ def ema(values, period):
   return e
 
 
+def calculate_atr(candles, period=14):
+  """Calculates Average True Range (ATR) to filter out low-volatility chop."""
+  if len(candles) < period + 1:
+    return 0.0010
+  tr_list = []
+  for i in range(1, len(candles)):
+    high = float(candles[i]["mid"]["h"])
+    low = float(candles[i]["mid"]["l"])
+    prev_close = float(candles[i - 1]["mid"]["c"])
+    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+    tr_list.append(tr)
+  return sum(tr_list[-period:]) / period
+
+
+def get_all_tradeable_instruments():
+  r = requests.get(
+      f"{OANDA}/accounts/{OANDA_ACCOUNT_ID}/instruments",
+      headers=HEADERS,
+      timeout=15,
+  ).json()
+  instruments = r.get("instruments", [])
+  return [i["name"] for i in instruments if i.get("type") == "CURRENCY"]
+
+
 def get_market_data(instr):
   r = requests.get(
       f"{OANDA}/instruments/{instr}/candles",
@@ -58,18 +88,27 @@ def get_market_data(instr):
       params={"granularity": "H1", "count": 300, "price": "M"},
       timeout=15,
   ).json()
-  closes = [float(c["mid"]["c"]) for c in r["candles"] if c["complete"]]
+  candles = r.get("candles", [])
+  completed_candles = [c for c in candles if c.get("complete", False)]
+  if len(completed_candles) < 50:
+    return None
+
+  closes = [float(c["mid"]["c"]) for c in completed_candles]
+  atr = calculate_atr(completed_candles)
+
   p = requests.get(
       f"{OANDA}/accounts/{OANDA_ACCOUNT_ID}/pricing",
       headers=HEADERS, params={"instruments": instr}, timeout=15,
-  ).json()["prices"][0]
+  ).json().get("prices", [{}])[0]
+
   return {
-      "bid": float(p["bids"][0]["price"]),
-      "ask": float(p["asks"][0]["price"]),
+      "bid": float(p.get("bids", [{}])[0].get("price", 0)),
+      "ask": float(p.get("asks", [{}])[0].get("price", 0)),
       "tradeable": p.get("tradeable", False),
       "ema50": ema(closes, 50),
-      "ema200": ema(closes, 200),
+      "ema200": ema(closes, 200) if len(closes) >= 200 else ema(closes, len(closes)),
       "last_closes": closes[-10:],
+      "atr": atr,
   }
 
 
@@ -85,61 +124,66 @@ def get_account_summary():
   return a.get("balance", "N/A"), a.get("unrealizedPL", "N/A"), a.get("openTradeCount", 0)
 
 
-# ---------- Trading Rule Engine (Deterministic Core) ----------
+# ---------- Loosened Rule Engine + ATR Volatility Filter ----------
 def evaluate_rules(md):
-  """Core trading logic based strictly on technical rules."""
   ema50 = md["ema50"]
-  ema200 = md["ema200"]
   last_close = md["last_closes"][-1]
+  prev_close = md["last_closes"][-2]
+  three_bars_ago = md["last_closes"][-4]
+  atr = md.get("atr", 0.0010)
 
-  # Bullish setup: EMA50 above EMA200 with recent momentum above EMA50
-  if ema50 > ema200 and last_close > ema50:
+  momentum = last_close - three_bars_ago
+  min_distance = 0.5 * atr
+
+  if (last_close > ema50 + min_distance) or (last_close > prev_close and momentum > min_distance):
     return {
         "should_trade": True,
         "direction": "BUY",
-        "sl_pips": 20.0,
-        "tp_pips": 40.0,
-        "reason": "Bullish trend: EMA50 > EMA200 with price holding above EMA50"
+        "sl_pips": 15.0,
+        "tp_pips": 30.0,
+        "reason": f"Bullish expansion: Distance > 0.5 ATR ({atr:.5f})"
     }
-  
-  # Bearish setup: EMA50 below EMA200 with recent momentum below EMA50
-  elif ema50 < ema200 and last_close < ema50:
+  elif (last_close < ema50 - min_distance) or (last_close < prev_close and momentum < -min_distance):
     return {
         "should_trade": True,
         "direction": "SELL",
-        "sl_pips": 20.0,
-        "tp_pips": 40.0,
-        "reason": "Bearish trend: EMA50 < EMA200 with price holding below EMA50"
+        "sl_pips": 15.0,
+        "tp_pips": 30.0,
+        "reason": f"Bearish expansion: Distance > 0.5 ATR ({atr:.5f})"
     }
 
-  return {"should_trade": False, "reason": "No high-probability setup found by rules."}
+  return {"should_trade": False, "reason": "Market in low-volatility squeeze (below ATR threshold)."}
 
 
-# ---------- Optional Gemini Second Opinion ----------
-def get_gemini_opinion(pair, md, rule_signal):
-  """Optional AI second opinion. Fails gracefully if Gemini is down/overloaded."""
+# ---------- OpenRouter AI Integration ----------
+def get_openrouter_opinion(pair, md, rule_signal):
   try:
     prompt = f"""
 You are a forex risk analyst reviewing a rule-based trade signal for {pair}.
 Rule Signal: {json.dumps(rule_signal)}
 Market Data: {json.dumps(md)}
-Provide a brief second opinion. Return JSON only:
-{{"agree": bool, "comment": "short analysis or warning"}}
+Provide a brief second opinion. Return JSON only in this exact format:
+{{"agree": true/false, "comment": "short analysis or warning"}}
 """
-    resp = gemini_client.models.generate_content(
-        model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
-        contents=prompt,
-        config={"response_mime_type": "application/json"},
+    model_choice = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    
+    response = openrouter_client.chat.completions.create(
+        model=model_choice,
+        messages=[
+            {"role": "system", "content": "You are a financial JSON generator."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        timeout=10
     )
-    data = json.loads(resp.text)
-    return data[0] if isinstance(data, list) else data
+    data = json.loads(response.choices[0].message.content)
+    return data
   except Exception as e:
-    print(f"Gemini second opinion unavailable (proceeding with rules only): {e!r}")
+    print(f"OpenRouter second opinion skipped for {pair}: {e!r}")
     return None
 
 
-def place_order(pair, direction, units, sl_pips, tp_pips, md):
-  instr = pair.replace("/", "_")
+def place_order(instr, direction, units, sl_pips, tp_pips, md):
   d, pip = decimals(instr), pip_size(instr)
   entry = md["ask"] if direction == "BUY" else md["bid"]
   sign = 1 if direction == "BUY" else -1
@@ -160,44 +204,56 @@ def place_order(pair, direction, units, sl_pips, tp_pips, md):
   return filled, entry, sl, tp, res
 
 
-def run_cycle(pair="EUR/USD", units=1000):
-  """Returns a plain-text report."""
-  instr = pair.replace("/", "_")
-  md = get_market_data(instr)
-  if not md["tradeable"]:
-    return "Market is closed / instrument not tradeable right now."
-  if open_trade_count(instr) > 0:
-    return f"Already have an open {pair} trade; skipping."
+def run_cycle_all_pairs(units=1000):
+  instruments = get_all_tradeable_instruments()
+  reports = []
+  executed_count = 0
 
-  # 1. Rules decide the trade execution
-  sig = evaluate_rules(md)
-  if not sig.get("should_trade"):
-    return "No high-probability setup found at this time."
+  for instr in instruments:
+    pair_display = instr.replace("_", "/")
+    
+    if open_trade_count(instr) > 0:
+      continue
 
-  # 2. Gemini gives an optional second opinion (won't block execution if down)
-  gemini_note = "Gemini Second Opinion: Skipped / Offline"
-  opinion = get_gemini_opinion(pair, md, sig)
-  if opinion:
-    agree = opinion.get("agree", True)
-    comment = opinion.get("comment", "N/A")
-    gemini_note = f"Gemini Second Opinion: {'Agree' if agree else 'Caution'} - {comment}"
+    md = get_market_data(instr)
+    if not md or not md["tradeable"]:
+      continue
 
-  # 3. Execute order based on rule signal
-  ok, entry, sl, tp, res = place_order(
-      pair, sig["direction"], units, float(sig["sl_pips"]), float(sig["tp_pips"]), md)
-  
-  if ok:
-    return (f"TRADE EXECUTED (OANDA DEMO)\n{pair} {sig['direction']} @ {entry}\n"
-            f"SL {sl} | TP {tp}\nReason: {sig['reason']}\n{gemini_note}")
-  
-  reject = (res.get("orderRejectTransaction") or res.get("orderCancelTransaction") or {})
-  return f"ORDER NOT FILLED\n{reject.get('reason') or res.get('errorMessage') or res}"
+    sig = evaluate_rules(md)
+    if not sig.get("should_trade"):
+      continue
+
+    opinion = get_openrouter_opinion(pair_display, md, sig)
+    ai_note = "OpenRouter AI: Offline / Skipped"
+    if opinion:
+      agree = opinion.get("agree", True)
+      comment = opinion.get("comment", "N/A")
+      ai_note = f"OpenRouter AI: {'Agree' if agree else 'Caution'} - {comment}"
+
+    ok, entry, sl, tp, res = place_order(
+        instr, sig["direction"], units, float(sig["sl_pips"]), float(sig["tp_pips"]), md)
+    
+    if ok:
+      executed_count += 1
+      reports.append(
+          f"TRADE EXECUTED ({pair_display})\n"
+          f"Direction: {sig['direction']} @ {entry}\n"
+          f"SL {sl} | TP {tp}\nReason: {sig['reason']}\n{ai_note}"
+      )
+    else:
+      reject = (res.get("orderRejectTransaction") or res.get("orderCancelTransaction") or {})
+      reports.append(f"ORDER FAILED ({pair_display})\nReason: {reject.get('reason') or res}")
+
+  if not reports:
+    return "Scan complete. No eligible trade setups across currency pairs right now."
+
+  return f"--- SCAN COMPLETED ({executed_count} trades opened) ---\n\n" + "\n\n".join(reports)
 
 
-# ---------- Routes ----------
+# ---------- FastAPI Routes & Telegram Commands ----------
 @app.get("/")
 def home():
-  return {"status": "Tris Agent is active!"}
+  return {"status": "Tris OpenRouter ATR Agent is active!"}
 
 
 @app.post("/telegram-webhook")
@@ -209,20 +265,47 @@ async def telegram_webhook(request: Request):
     return {"status": "ignored"}
 
   if str(msg["chat"]["id"]) != TELEGRAM_CHAT_ID:
-    print(f"Unauthorized chat id: {msg['chat']['id']} (expected {TELEGRAM_CHAT_ID})")
     return {"status": "unauthorized"}
 
   cmd = msg["text"].strip().split("@")[0].lower()
 
   try:
     if cmd in ("/start", "/help"):
-      await say("Tris Bot Active\n\n/status - balance & bot state\n"
-                "/trade - force analysis & trade\n/pause - pause cron trading\n"
-                "/resume - resume cron trading")
+      await say(
+          "Tris Bot Active (ATR + OpenRouter Multi-Pair)\n\n"
+          "/status - view account balance & state\n"
+          "/debug - run indicator & rule test on EUR/USD (dry run)\n"
+          "/trade - scan all available OANDA pairs & execute\n"
+          "/pause - pause automated cron trading\n"
+          "/resume - resume automated cron trading"
+      )
     elif cmd == "/status":
       bal, pnl, n = await asyncio.to_thread(get_account_summary)
-      await say(f"TRIS STATUS\nBot: {'PAUSED' if BOT_PAUSED else 'ACTIVE'}\n"
-                f"Balance: {bal}\nUnrealized PnL: {pnl}\nOpen trades: {n}")
+      await say(
+          f"TRIS STATUS\n"
+          f"Bot State: {'PAUSED' if BOT_PAUSED else 'ACTIVE'}\n"
+          f"Balance: {bal}\n"
+          f"Unrealized PnL: {pnl}\n"
+          f"Open Trades: {n}"
+      )
+    elif cmd == "/debug":
+      await say("Running debug test on EUR/USD...")
+      md = await asyncio.to_thread(get_market_data, "EUR_USD")
+      if not md:
+        await say("Debug Error: Unable to fetch EUR/USD market data.")
+      else:
+        sig = evaluate_rules(md)
+        opinion = await asyncio.to_thread(get_openrouter_opinion, "EUR/USD", md, sig)
+        debug_msg = (
+            f"DEBUG REPORT (EUR/USD)\n"
+            f"Last Close: {md['last_closes'][-1]:.5f}\n"
+            f"EMA50: {md['ema50']:.5f}\n"
+            f"EMA200: {md['ema200']:.5f}\n"
+            f"ATR(14): {md['atr']:.5f}\n"
+            f"Rule Result: {json.dumps(sig, indent=2)}\n"
+            f"OpenRouter AI: {json.dumps(opinion) if opinion else 'Offline/Skipped'}"
+        )
+        await say(debug_msg)
     elif cmd == "/pause":
       BOT_PAUSED = True
       await say("Automated trading PAUSED.")
@@ -230,13 +313,16 @@ async def telegram_webhook(request: Request):
       BOT_PAUSED = False
       await say("Automated trading RESUMED.")
     elif cmd == "/trade":
-      await say("Running analysis...")
-      await say(await asyncio.to_thread(run_cycle, "EUR/USD"))
+      await say("Scanning all available OANDA currency pairs with ATR filter...")
+      report = await asyncio.to_thread(run_cycle_all_pairs)
+      await say(report)
+    else:
+      await say(f"Unknown command: {cmd}\nType /help for available commands.")
   except Exception as e:
     print("Handler error:", repr(e))
-    await say(f"Error: {e!r}")
+    await say(f"Error handling command: {e!r}")
 
-  return {"status": "ok"}   # always 200 so Telegram doesn't retry
+  return {"status": "ok"}   # Always return 200 OK so Telegram doesn't retry
 
 
 @app.get("/run-agent-check")
@@ -246,13 +332,14 @@ async def run_agent_check(key: str = ""):
   if BOT_PAUSED:
     return {"status": "paused"}
   try:
-    report = await asyncio.to_thread(run_cycle, "EUR/USD")
+    report = await asyncio.to_thread(run_cycle_all_pairs)
   except Exception as e:
     await say(f"Cron error: {e!r}")
     return {"status": "error", "detail": str(e)}
-  if "EXECUTED" in report or "NOT FILLED" in report:
+
+  if "EXECUTED" in report:
     await say(report)
-  return {"status": report}
+  return {"status": "scan complete", "detail": report}
 
 
 if __name__ == "__main__":
