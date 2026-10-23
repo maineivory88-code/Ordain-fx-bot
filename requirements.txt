@@ -4,3 +4,4 @@ v20
 fastapi
 uvicorn
 google-genai
+openai
