@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import re
-import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,7 +20,6 @@ from fastapi import FastAPI, HTTPException, Request
 from openai import OpenAI
 from telegram import Bot
 
-# Configure detailed logging to stdout so Render captures everything
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -38,6 +37,7 @@ TELEGRAM_LIMIT = 4000
 SEEN_UPDATES_LIMIT = 500
 CANDLE_LOOKBACK = 300
 MIN_CLOSES = 50
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,10 @@ class ScanResult:
     executed: int = 0
     failed: int = 0
     alert: bool = False
+
+
+class SkipPair(Exception):
+    pass
 
 
 OpinionFn = Callable[[str, dict, dict], dict | None]
@@ -157,6 +161,7 @@ def chunk_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
 
 
 def remember_update(seen: OrderedDict, update_id: Any) -> bool:
+    """Return True if this update was already processed."""
     if update_id is None:
         return False
     if update_id in seen:
@@ -216,7 +221,13 @@ def evaluate_rules(md: dict) -> dict:
     momentum_up = last_close > prev_close and momentum > min_distance
     momentum_down = last_close < prev_close and momentum < -min_distance
 
-    if above or momentum_up:
+    bullish = above or momentum_up
+    bearish = below or momentum_down
+    # Conflicting signals (e.g. above EMA but momentum falling hard) -> stand aside.
+    if bullish and bearish:
+        return {"should_trade": False, "reason": "Conflicting trend and momentum signals."}
+
+    if bullish:
         return {
             "should_trade": True,
             "direction": "BUY",
@@ -224,7 +235,7 @@ def evaluate_rules(md: dict) -> dict:
             "tp_pips": 30.0,
             "reason": f"Bullish expansion (ATR {atr:.5f})",
         }
-    if below or momentum_down:
+    if bearish:
         return {
             "should_trade": True,
             "direction": "SELL",
@@ -232,10 +243,7 @@ def evaluate_rules(md: dict) -> dict:
             "tp_pips": 30.0,
             "reason": f"Bearish expansion (ATR {atr:.5f})",
         }
-    return {
-        "should_trade": False,
-        "reason": "No expansion: inside 0.5 ATR band.",
-    }
+    return {"should_trade": False, "reason": "No expansion: inside 0.5 ATR band."}
 
 
 def price_quantum(precision: int) -> Decimal:
@@ -381,10 +389,6 @@ def build_market_snapshot(spec: InstrumentSpec, candles: list[dict], price: dict
     }
 
 
-class SkipPair(Exception):
-    pass
-
-
 def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule_signal: dict) -> dict | None:
     prompt = (
         f"Review trade signal for {pair}.\nSignal: {json.dumps(rule_signal)}\nData: {json.dumps(md)}\n"
@@ -462,7 +466,11 @@ class OandaBroker:
         return {str(t["instrument"]) for t in (data.get("trades") or []) if isinstance(t, dict)}
 
     def market_data(self, spec: InstrumentSpec) -> dict | None:
-        candles = self._request("GET", f"/instruments/{quote(spec.name, safe='')}/candles", params={"granularity": "H1", "count": CANDLE_LOOKBACK, "price": "M"})
+        candles = self._request(
+            "GET",
+            f"/instruments/{quote(spec.name, safe='')}/candles",
+            params={"granularity": "H1", "count": CANDLE_LOOKBACK, "price": "M"},
+        )
         pricing = self._request("GET", self._account_path("/pricing"), params={"instruments": spec.name})
         prices = pricing.get("prices") or []
         if not prices:
@@ -489,7 +497,8 @@ def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
     except Exception as exc:
         return ScanResult(report=f"Scan failed: {exc}", failed=1, alert=True)
 
-    reports, executed, failed = [], 0, 0
+    reports: list[str] = []
+    executed, failed = 0, 0
     for spec in instruments:
         if spec.name in open_instruments:
             continue
@@ -501,22 +510,37 @@ def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
             if not signal.get("should_trade"):
                 continue
             opinion = opinion_fn(spec.pair, md, signal)
-            status, entry, stop, target, reason = broker.submit(spec, signal["direction"], units, float(signal["sl_pips"]), float(signal["tp_pips"]), md)
+            status, entry, stop, target, reason = broker.submit(
+                spec, signal["direction"], units, float(signal["sl_pips"]), float(signal["tp_pips"]), md
+            )
             if status == "filled":
                 executed += 1
-                reports.append(f"TRADE EXECUTED ({spec.pair})\nDirection: {signal['direction']} @ {format_decimal(entry)}\n{ai_note(opinion)}")
-            elif status != "duplicate":
+                reports.append(
+                    f"TRADE EXECUTED ({spec.pair})\n"
+                    f"Direction: {signal['direction']} @ {format_decimal(entry)}\n"
+                    f"SL: {format_decimal(stop)} | TP: {format_decimal(target)}\n"
+                    f"{ai_note(opinion)}"
+                )
+            else:
                 failed += 1
                 reports.append(f"ORDER FAILED ({spec.pair}): {reason}")
         except SkipPair as exc:
-            pass
-        except Exception as exc:
+            logger.info("Skipped %s: %s", spec.name, exc)
+        except Exception:
             logger.exception("Pair scan error for %s", spec.name)
             failed += 1
 
     if not reports:
-        return ScanResult(report="Scan complete. No eligible setups found.", executed=0, failed=0, alert=False)
-    return ScanResult(report=f"--- SCAN COMPLETED ({executed} opened) ---\n\n" + "\n\n".join(reports), executed=executed, failed=failed, alert=True)
+        note = "Scan complete. No eligible setups found."
+        if failed:
+            note += f" ({failed} pair(s) errored; check logs.)"
+        return ScanResult(report=note, executed=0, failed=failed, alert=False)
+    return ScanResult(
+        report=f"--- SCAN COMPLETED ({executed} opened) ---\n\n" + "\n\n".join(reports),
+        executed=executed,
+        failed=failed,
+        alert=True,
+    )
 
 
 @asynccontextmanager
@@ -530,97 +554,88 @@ async def lifespan(app: FastAPI):
 
     bot = Bot(token=settings.telegram_token)
     broker = OandaBroker(settings)
+    ai_client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=settings.openrouter_api_key, timeout=30)
     app.state.settings = settings
     app.state.bot = bot
     app.state.broker = broker
-    app.state.opinion_fn = lambda p, m, s: get_openrouter_opinion(
-        OpenAI(base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)", api_key=settings.openrouter_api_key),
-        settings.openrouter_model, p, m, s
-    )
+    app.state.opinion_fn = lambda p, m, s: get_openrouter_opinion(ai_client, settings.openrouter_model, p, m, s)
+
     await bot.initialize()
     if settings.public_url:
         try:
-            kwargs = {"allowed_updates": ["message"]}
+            kwargs: dict[str, Any] = {"allowed_updates": ["message"]}
             if settings.webhook_secret:
                 kwargs["secret_token"] = settings.webhook_secret
             await bot.set_webhook(url=webhook_url(settings.public_url), **kwargs)
-            logger.info("Webhook registered successfully to %s", webhook_url(settings.public_url))
+            logger.info("Webhook registered to %s", webhook_url(settings.public_url))
         except Exception:
             logger.exception("Failed to set webhook")
+    else:
+        logger.warning("PUBLIC_URL is not set: Telegram webhook NOT registered, bot will not receive commands")
     yield
     await bot.shutdown()
     broker.close()
 
 
 app = FastAPI(lifespan=lifespan)
+# Defaults so handlers never hit AttributeError if config failed to load.
+app.state.settings = None
+app.state.bot = None
+app.state.broker = None
+app.state.opinion_fn = None
 app.state.paused = False
 app.state.scanning = False
 app.state.seen_updates = OrderedDict()
+app.state.tasks = set()
 
 
-async def say(text: str) -> None:
+async def say(text: str, chat_id: str | None = None) -> None:
     bot = app.state.bot
     settings = app.state.settings
     if not bot or not settings:
         return
+    target = chat_id or settings.telegram_chat_id
     for part in chunk_text(text):
-        await bot.send_message(chat_id=settings.telegram_chat_id, text=part)
+        try:
+            await bot.send_message(chat_id=target, text=part)
+        except Exception:
+            logger.exception("Failed to send Telegram message")
+            return
         await asyncio.sleep(0.3)
 
 
-@app.get("/")
-def home():
-    return {"status": "Active", "configured": app.state.settings is not None}
-
-
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    settings = app.state.settings
-    if not settings:
-        logger.warning("Webhook received but bot settings are unconfigured/None!")
-        return {"status": "not configured"}
-
-    if settings.webhook_secret:
-        if request.headers.get("x-telegram-bot-api-secret-token", "") != settings.webhook_secret:
-            logger.warning("Webhook secret token mismatch!")
-            return {"status": "unauthorized"}
-
+async def run_scan() -> ScanResult | None:
+    """Run one scan in a worker thread. Returns None if a scan is already running."""
+    if app.state.scanning:
+        return None
+    app.state.scanning = True
     try:
-        data = await request.json()
-    except Exception:
-        return {"status": "bad json"}
-
-    logger.info("Received Telegram Update payload: %s", json.dumps(data))
-
-    msg = data.get("message")
-    if not isinstance(msg, dict) or "text" not in msg:
-        return {"status": "ignored"}
-
-    chat = msg.get("chat") or {}
-    sender_chat_id = str(chat.get("id"))
-    
-    if sender_chat_id != settings.telegram_chat_id:
-        logger.warning(
-            "UNAUTHORIZED CHAT ID REJECTED! Incoming sender chat ID was [%s], "
-            "but TELEGRAM_CHAT_ID environment variable is set to [%s].",
-            sender_chat_id,
-            settings.telegram_chat_id
+        return await asyncio.to_thread(
+            run_cycle, app.state.broker, app.state.settings.trade_units, app.state.opinion_fn
         )
-        return {"status": "unauthorized"}
+    finally:
+        app.state.scanning = False
 
-    cmd = parse_command(str(msg.get("text") or ""))
-    logger.info("Parsed command successfully: %s", cmd)
 
+async def handle_command(cmd: str) -> None:
     try:
         if cmd in ("/start", "/help"):
-            await say("Tris Bot Active (ATR + OpenRouter)\n\n/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n/pause - pause\n/resume - resume")
+            await say(
+                "Tris Bot Active (ATR + OpenRouter)\n\n"
+                "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
+                "/pause - pause\n/resume - resume"
+            )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
-            await say(f"STATUS\nBalance: {bal}\nPnL: {pnl}\nOpen Trades: {count}")
+            state = "PAUSED" if app.state.paused else "RUNNING"
+            await say(f"STATUS ({state}, {app.state.settings.oanda_env})\nBalance: {bal}\nPnL: {pnl}\nOpen Trades: {count}")
         elif cmd == "/debug":
             await say("Running debug test on EUR/USD...")
             instruments = await asyncio.to_thread(app.state.broker.list_instruments)
-            spec = next((i for i in instruments if i.name == "EUR_USD"), InstrumentSpec("EUR_USD", -4, 5, 0, Decimal("1"), Decimal("0")))
+            spec = next(
+                (i for i in instruments if i.name == "EUR_USD"),
+                InstrumentSpec("EUR_USD", -4, 5, 0, Decimal("1"), Decimal("0")),
+            )
             md = await asyncio.to_thread(app.state.broker.market_data, spec)
             if not md:
                 await say("Debug Error: Could not fetch EUR_USD data.")
@@ -634,15 +649,69 @@ async def telegram_webhook(request: Request):
             app.state.paused = False
             await say("Trading resumed.")
         elif cmd == "/trade":
+            if app.state.paused:
+                await say("Trading is paused. Send /resume first.")
+                return
             await say("Manual scan triggered...")
-            result = await asyncio.to_thread(run_cycle, app.state.broker, settings.trade_units, app.state.opinion_fn)
-            await say(result.report)
+            result = await run_scan()
+            await say("A scan is already running." if result is None else result.report)
         else:
-            await say(f"Unknown command: {cmd}")
+            await say(f"Unknown command: {cmd}\nSend /help for the list.")
     except Exception as exc:
         logger.exception("Error executing command handler")
         await say(f"Error: {exc}")
 
+
+@app.get("/")
+def home():
+    return {"status": "Active", "configured": app.state.settings is not None}
+
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    settings = app.state.settings
+    if not settings:
+        logger.warning("Webhook received but settings are not loaded (check env vars)")
+        return {"status": "not configured"}
+
+    if settings.webhook_secret:
+        received = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not hmac.compare_digest(received, settings.webhook_secret):
+            logger.warning("Webhook secret token mismatch")
+            return {"status": "unauthorized"}
+
+    try:
+        data = await request.json()
+    except Exception:
+        return {"status": "bad json"}
+
+    if remember_update(app.state.seen_updates, data.get("update_id")):
+        return {"status": "duplicate"}
+
+    msg = data.get("message")
+    if not isinstance(msg, dict) or "text" not in msg:
+        return {"status": "ignored"}
+
+    sender_chat_id = str((msg.get("chat") or {}).get("id"))
+    cmd = parse_command(str(msg.get("text") or ""))
+
+    if sender_chat_id != settings.telegram_chat_id:
+        logger.warning(
+            "UNAUTHORIZED chat rejected: incoming chat id [%s] != TELEGRAM_CHAT_ID [%s]",
+            sender_chat_id,
+            settings.telegram_chat_id,
+        )
+        if cmd == "/id":  # lets you discover the right chat id to put in TELEGRAM_CHAT_ID
+            await say(f"This chat's ID is: {sender_chat_id}", chat_id=sender_chat_id)
+        return {"status": "unauthorized"}
+
+    logger.info("Command received: %s", cmd)
+
+    # Reply to Telegram immediately; long work (scans) runs in the background so
+    # Telegram doesn't time out and retry the webhook.
+    task = asyncio.create_task(handle_command(cmd))
+    app.state.tasks.add(task)
+    task.add_done_callback(app.state.tasks.discard)
     return {"status": "ok"}
 
 
@@ -650,11 +719,16 @@ async def telegram_webhook(request: Request):
 @app.post("/run-agent-check")
 async def run_agent_check(request: Request, key: str = ""):
     settings = app.state.settings
-    if not settings or (key != settings.cron_secret and request.headers.get("x-cron-key") != settings.cron_secret):
+    if not settings or not settings.cron_secret:
+        raise HTTPException(status_code=403, detail="CRON_SECRET not configured")
+    supplied = key or request.headers.get("x-cron-key", "")
+    if not hmac.compare_digest(supplied, settings.cron_secret):
         raise HTTPException(status_code=403)
     if app.state.paused:
         return {"status": "paused"}
-    result = await asyncio.to_thread(run_cycle, app.state.broker, settings.trade_units, app.state.opinion_fn)
+    result = await run_scan()
+    if result is None:
+        return {"status": "busy"}
     if result.alert:
         await say(result.report)
     return {"status": "ok", "detail": result.report}
@@ -662,4 +736,5 @@ async def run_agent_check(request: Request, key: str = ""):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
