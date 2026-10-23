@@ -323,7 +323,7 @@ def interpret_order_response(res: Any) -> tuple[str, str]:
 def extract_json(text: str) -> dict:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=core_flags := re.IGNORECASE).strip()
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
@@ -433,7 +433,7 @@ class OandaBroker:
         kwargs.setdefault("timeout", 20)
         response = self.session.request(method, url, **kwargs)
         if response.status_code >= 400:
-            raise RuntimeError(f"OANDA HTTP {response.status_code}: {response.text[:180]}️")
+            raise RuntimeError(f"OANDA HTTP {response.status_code}: {response.text[:180]}")
         return response.json()
 
     def _account_path(self, suffix: str) -> str:
@@ -599,12 +599,10 @@ async def telegram_webhook(request: Request):
     chat = msg.get("chat") or {}
     sender_chat_id = str(chat.get("id"))
     
-    # ─── LOGGING MISMATCH CRITICAL DEBUG INFO ───
     if sender_chat_id != settings.telegram_chat_id:
         logger.warning(
             "UNAUTHORIZED CHAT ID REJECTED! Incoming sender chat ID was [%s], "
-            "but TELEGRAM_CHAT_ID environment variable is set to [%s]. "
-            "Update your Render environment variable to match your exact chat ID!",
+            "but TELEGRAM_CHAT_ID environment variable is set to [%s].",
             sender_chat_id,
             settings.telegram_chat_id
         )
@@ -649,6 +647,7 @@ async def telegram_webhook(request: Request):
 
 
 @app.get("/run-agent-check")
+@app.post("/run-agent-check")
 async def run_agent_check(request: Request, key: str = ""):
     settings = app.state.settings
     if not settings or (key != settings.cron_secret and request.headers.get("x-cron-key") != settings.cron_secret):
