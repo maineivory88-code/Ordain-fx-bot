@@ -95,7 +95,7 @@ Return JSON only:
   "sl_pips": number, "tp_pips": number, "reason": "short text"}}
 """
   resp = gemini_client.models.generate_content(
-      model="gemini-2.5-flash", contents=prompt,
+       model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), contents=prompt,  , contents=prompt,
       config={"response_mime_type": "application/json"},
   )
   data = json.loads(resp.text)
