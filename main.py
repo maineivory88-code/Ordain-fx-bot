@@ -13,8 +13,8 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 OANDA_API_KEY = os.environ["OANDA_API_KEY"]
 OANDA_ACCOUNT_ID = os.environ["OANDA_ACCOUNT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")# e.g. https://your-app.onrender.com
-CRON_SECRET = os.getenv("CRON_SECRET", "")    # protects /run-agent-check
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")  # e.g. https://your-app.onrender.com
+CRON_SECRET = os.getenv("CRON_SECRET", "")  # protects /run-agent-check
 
 OANDA = "https://api-fxpractice.oanda.com/v3"
 HEADERS = {"Authorization": f"Bearer {OANDA_API_KEY}", "Content-Type": "application/json"}
@@ -34,7 +34,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 async def say(text):
-  # Plain text: no Markdown, so Gemini output can't break the message
+  # Plain text: no Markdown, so Gemini or external output can't break the message
   await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
 
@@ -85,21 +85,57 @@ def get_account_summary():
   return a.get("balance", "N/A"), a.get("unrealizedPL", "N/A"), a.get("openTradeCount", 0)
 
 
-def analyze(pair, md):
-  prompt = f"""
-You are a forex analyst. Using ONLY this live data for {pair}, decide whether
-to trade (EMA50/EMA200 trend + recent momentum). Do not invent prices.
-Data: {json.dumps(md)}
-Return JSON only:
-{{"should_trade": bool, "direction": "BUY" or "SELL",
-  "sl_pips": number, "tp_pips": number, "reason": "short text"}}
+# ---------- Trading Rule Engine (Deterministic Core) ----------
+def evaluate_rules(md):
+  """Core trading logic based strictly on technical rules."""
+  ema50 = md["ema50"]
+  ema200 = md["ema200"]
+  last_close = md["last_closes"][-1]
+
+  # Bullish setup: EMA50 above EMA200 with recent momentum above EMA50
+  if ema50 > ema200 and last_close > ema50:
+    return {
+        "should_trade": True,
+        "direction": "BUY",
+        "sl_pips": 20.0,
+        "tp_pips": 40.0,
+        "reason": "Bullish trend: EMA50 > EMA200 with price holding above EMA50"
+    }
+  
+  # Bearish setup: EMA50 below EMA200 with recent momentum below EMA50
+  elif ema50 < ema200 and last_close < ema50:
+    return {
+        "should_trade": True,
+        "direction": "SELL",
+        "sl_pips": 20.0,
+        "tp_pips": 40.0,
+        "reason": "Bearish trend: EMA50 < EMA200 with price holding below EMA50"
+    }
+
+  return {"should_trade": False, "reason": "No high-probability setup found by rules."}
+
+
+# ---------- Optional Gemini Second Opinion ----------
+def get_gemini_opinion(pair, md, rule_signal):
+  """Optional AI second opinion. Fails gracefully if Gemini is down/overloaded."""
+  try:
+    prompt = f"""
+You are a forex risk analyst reviewing a rule-based trade signal for {pair}.
+Rule Signal: {json.dumps(rule_signal)}
+Market Data: {json.dumps(md)}
+Provide a brief second opinion. Return JSON only:
+{{"agree": bool, "comment": "short analysis or warning"}}
 """
-  resp = gemini_client.models.generate_content(
-                model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), contents=prompt,
-      config={"response_mime_type": "application/json"},
-  )
-  data = json.loads(resp.text)
-  return data[0] if isinstance(data, list) else data
+    resp = gemini_client.models.generate_content(
+        model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
+    )
+    data = json.loads(resp.text)
+    return data[0] if isinstance(data, list) else data
+  except Exception as e:
+    print(f"Gemini second opinion unavailable (proceeding with rules only): {e!r}")
+    return None
 
 
 def place_order(pair, direction, units, sl_pips, tp_pips, md):
@@ -132,14 +168,28 @@ def run_cycle(pair="EUR/USD", units=1000):
     return "Market is closed / instrument not tradeable right now."
   if open_trade_count(instr) > 0:
     return f"Already have an open {pair} trade; skipping."
-  sig = analyze(pair, md)
+
+  # 1. Rules decide the trade execution
+  sig = evaluate_rules(md)
   if not sig.get("should_trade"):
     return "No high-probability setup found at this time."
+
+  # 2. Gemini gives an optional second opinion (won't block execution if down)
+  gemini_note = "Gemini Second Opinion: Skipped / Offline"
+  opinion = get_gemini_opinion(pair, md, sig)
+  if opinion:
+    agree = opinion.get("agree", True)
+    comment = opinion.get("comment", "N/A")
+    gemini_note = f"Gemini Second Opinion: {'Agree' if agree else 'Caution'} - {comment}"
+
+  # 3. Execute order based on rule signal
   ok, entry, sl, tp, res = place_order(
       pair, sig["direction"], units, float(sig["sl_pips"]), float(sig["tp_pips"]), md)
+  
   if ok:
     return (f"TRADE EXECUTED (OANDA DEMO)\n{pair} {sig['direction']} @ {entry}\n"
-            f"SL {sl} | TP {tp}\nReason: {sig['reason']}")
+            f"SL {sl} | TP {tp}\nReason: {sig['reason']}\n{gemini_note}")
+  
   reject = (res.get("orderRejectTransaction") or res.get("orderCancelTransaction") or {})
   return f"ORDER NOT FILLED\n{reject.get('reason') or res.get('errorMessage') or res}"
 
