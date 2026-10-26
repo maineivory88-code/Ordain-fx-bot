@@ -1,4 +1,4 @@
-"""Tris forex agent: OANDA execution, ATR rules, OpenRouter notes, Telegram control."""
+"""Tris forex agent: OANDA execution, ATR rules, OpenRouter review, Telegram control, with risk guardrails."""
 
 from __future__ import annotations
 
@@ -39,6 +39,10 @@ CANDLE_LOOKBACK = 300
 MIN_CLOSES = 50
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+SL_PIPS = 15.0
+TP_PIPS = 30.0
+MIN_STOP_PIPS = 8.0   # never place a stop tighter than this, so normal noise can't trigger it
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -54,6 +58,11 @@ class Settings:
     openrouter_model: str
     trade_units: Decimal
     webhook_secret: str
+    max_open_trades: int
+    ai_blocks_on_disagree: bool
+    ai_required: bool
+    daily_loss_limit: Decimal
+    max_spread_pips: float
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,11 @@ class InstrumentSpec:
     def pair(self) -> str:
         return self.name.replace("_", "/")
 
+    @property
+    def currencies(self) -> tuple[str, str]:
+        base, quote_ccy = self.name.split("_", 1)
+        return base, quote_ccy
+
 
 @dataclass
 class ScanResult:
@@ -87,6 +101,13 @@ class SkipPair(Exception):
 
 
 OpinionFn = Callable[[str, dict, dict], dict | None]
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
 
 
 def load_settings() -> Settings:
@@ -107,6 +128,22 @@ def load_settings() -> Settings:
     if units <= 0:
         raise RuntimeError("TRADE_UNITS must be greater than 0")
 
+    loss_raw = os.getenv("DAILY_LOSS_LIMIT", "10").strip()
+    try:
+        daily_loss_limit = Decimal(loss_raw)
+    except Exception as exc:
+        raise RuntimeError("DAILY_LOSS_LIMIT must be a number") from exc
+    if daily_loss_limit <= 0:
+        raise RuntimeError("DAILY_LOSS_LIMIT must be greater than 0")
+
+    try:
+        max_open = int(os.getenv("MAX_OPEN_TRADES", "2").strip())
+        max_spread = float(os.getenv("MAX_SPREAD_PIPS", "1.5").strip())
+    except ValueError as exc:
+        raise RuntimeError("MAX_OPEN_TRADES and MAX_SPREAD_PIPS must be numbers") from exc
+    if max_open < 1:
+        raise RuntimeError("MAX_OPEN_TRADES must be at least 1")
+
     secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
     if secret and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
         raise RuntimeError("TELEGRAM_WEBHOOK_SECRET must match [A-Za-z0-9_-]{1,256}")
@@ -125,6 +162,11 @@ def load_settings() -> Settings:
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free",
         trade_units=units,
         webhook_secret=secret,
+        max_open_trades=max_open,
+        ai_blocks_on_disagree=_bool_env("AI_BLOCKS_ON_DISAGREE", True),
+        ai_required=_bool_env("AI_REQUIRED", False),
+        daily_loss_limit=daily_loss_limit,
+        max_spread_pips=max_spread,
     )
 
 
@@ -200,7 +242,7 @@ def calculate_atr(candles: list[dict], period: int = 14) -> float:
     return sum(window) / len(window)
 
 
-def evaluate_rules(md: dict) -> dict:
+def evaluate_rules(md: dict, pip: float = 0.0001) -> dict:
     closes = md.get("last_closes") or []
     if len(closes) < 4:
         return {"should_trade": False, "reason": "Not enough completed closes."}
@@ -208,6 +250,10 @@ def evaluate_rules(md: dict) -> dict:
     atr = float(md.get("atr") or 0)
     if atr <= 0:
         return {"should_trade": False, "reason": "ATR is zero; skipping flat or invalid data."}
+
+    # Stops are never tighter than MIN_STOP_PIPS, so noise can't trigger them.
+    if atr / pip < MIN_STOP_PIPS:
+        return {"should_trade": False, "reason": "Volatility too low for the stop distance."}
 
     ema50 = float(md["ema50"])
     last_close = float(closes[-1])
@@ -223,26 +269,15 @@ def evaluate_rules(md: dict) -> dict:
 
     bullish = above or momentum_up
     bearish = below or momentum_down
-    # Conflicting signals (e.g. above EMA but momentum falling hard) -> stand aside.
     if bullish and bearish:
         return {"should_trade": False, "reason": "Conflicting trend and momentum signals."}
 
     if bullish:
-        return {
-            "should_trade": True,
-            "direction": "BUY",
-            "sl_pips": 15.0,
-            "tp_pips": 30.0,
-            "reason": f"Bullish expansion (ATR {atr:.5f})",
-        }
+        return {"should_trade": True, "direction": "BUY", "sl_pips": SL_PIPS, "tp_pips": TP_PIPS,
+                "reason": f"Bullish expansion (ATR {atr:.5f})"}
     if bearish:
-        return {
-            "should_trade": True,
-            "direction": "SELL",
-            "sl_pips": 15.0,
-            "tp_pips": 30.0,
-            "reason": f"Bearish expansion (ATR {atr:.5f})",
-        }
+        return {"should_trade": True, "direction": "SELL", "sl_pips": SL_PIPS, "tp_pips": TP_PIPS,
+                "reason": f"Bearish expansion (ATR {atr:.5f})"}
     return {"should_trade": False, "reason": "No expansion: inside 0.5 ATR band."}
 
 
@@ -254,14 +289,8 @@ def format_decimal(value: Decimal) -> str:
     return format(value, "f")
 
 
-def protective_prices(
-    entry: Decimal,
-    direction: str,
-    sl_pips: Decimal,
-    tp_pips: Decimal,
-    pip: Decimal,
-    precision: int,
-) -> tuple[Decimal, Decimal]:
+def protective_prices(entry: Decimal, direction: str, sl_pips: Decimal, tp_pips: Decimal,
+                      pip: Decimal, precision: int) -> tuple[Decimal, Decimal]:
     quantum = price_quantum(precision)
     sl_distance = (sl_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
     tp_distance = (tp_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
@@ -292,14 +321,8 @@ def order_units(units: Decimal, direction: str, spec: InstrumentSpec) -> str:
 def build_order(spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, tp_pips: float, md: dict) -> dict:
     entry_key = "ask" if direction == "BUY" else "bid"
     entry = Decimal(md[entry_key])
-    stop, target = protective_prices(
-        entry,
-        direction,
-        Decimal(str(sl_pips)),
-        Decimal(str(tp_pips)),
-        spec.pip,
-        spec.display_precision,
-    )
+    stop, target = protective_prices(entry, direction, Decimal(str(sl_pips)), Decimal(str(tp_pips)),
+                                     spec.pip, spec.display_precision)
     return {
         "order": {
             "units": order_units(units, direction, spec),
@@ -338,13 +361,14 @@ def extract_json(text: str) -> dict:
         start, end = cleaned.find("{"), cleaned.rfind("}")
         if start < 0 or end <= start:
             raise
-        data = json.loads(cleaned[start : end + 1])
+        data = json.loads(cleaned[start: end + 1])
     if not isinstance(data, dict):
         raise ValueError("model JSON was not an object")
     return data
 
 
 def explicit_disagree(opinion: dict | None) -> bool:
+    """True only when the model explicitly says agree = false. A missing value is not a disagreement."""
     if not opinion or "agree" not in opinion:
         return False
     value = opinion.get("agree")
@@ -380,6 +404,7 @@ def build_market_snapshot(spec: InstrumentSpec, candles: list[dict], price: dict
     return {
         "bid": format_decimal(bid),
         "ask": format_decimal(ask),
+        "spread_pips": float((ask - bid) / spec.pip),
         "tradeable": bool(price.get("tradeable", True)),
         "ema50": ema(closes, 50),
         "ema200": ema(closes, 200),
@@ -392,7 +417,7 @@ def build_market_snapshot(spec: InstrumentSpec, candles: list[dict], price: dict
 def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule_signal: dict) -> dict | None:
     prompt = (
         f"Review trade signal for {pair}.\nSignal: {json.dumps(rule_signal)}\nData: {json.dumps(md)}\n"
-        'Return JSON only: {"agree": true, "comment": "short text"}'
+        'Return JSON only: {"agree": true or false, "comment": "short text"}'
     )
     try:
         response = client.chat.completions.create(
@@ -405,7 +430,9 @@ def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule
         )
         content = response.choices[0].message.content or ""
         data = extract_json(content)
-        return {"agree": data.get("agree", True), "comment": str(data.get("comment", "N/A"))[:500]}
+        if not isinstance(data.get("agree"), bool):
+            return None  # unusable answer counts as "no opinion", not agreement
+        return {"agree": data["agree"], "comment": str(data.get("comment", "N/A"))[:500]}
     except Exception as exc:
         logger.warning("OpenRouter opinion skipped for %s: %r", pair, exc)
         return None
@@ -418,16 +445,34 @@ def ai_note(opinion: dict | None) -> str:
     return f"OpenRouter AI: {'Agree' if agree else 'Caution'} - {opinion.get('comment', 'N/A')}"
 
 
+def guardrail_block(signal_pair: str, direction: str, opinion: dict | None,
+                    open_instruments: set[str], open_currencies: set[str], settings: Settings,
+                    spread_pips: float, daily_pnl: Decimal, spec: InstrumentSpec) -> str | None:
+    """Return a reason string if the trade must NOT be placed, otherwise None."""
+    if len(open_instruments) >= settings.max_open_trades:
+        return f"max open trades reached ({settings.max_open_trades})"
+    base, quote_ccy = spec.currencies
+    if base in open_currencies or quote_ccy in open_currencies:
+        return "already exposed to one of these currencies"
+    if spread_pips > settings.max_spread_pips:
+        return f"spread {spread_pips:.1f} pips is above the limit"
+    if daily_pnl <= -settings.daily_loss_limit:
+        return f"daily loss limit reached ({daily_pnl})"
+    if settings.ai_required and opinion is None:
+        return "AI review unavailable and AI_REQUIRED is on"
+    if settings.ai_blocks_on_disagree and explicit_disagree(opinion):
+        return f"AI disagreed: {opinion.get('comment', '')}"
+    return None
+
+
 class OandaBroker:
     def __init__(self, settings: Settings, session: requests.Session | None = None):
         self.settings = settings
         self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {settings.oanda_api_key}",
-                "Content-Type": "application/json",
-            }
-        )
+        self.session.headers.update({
+            "Authorization": f"Bearer {settings.oanda_api_key}",
+            "Content-Type": "application/json",
+        })
 
     def close(self) -> None:
         self.session.close()
@@ -449,21 +494,19 @@ class OandaBroker:
         specs = []
         for raw in data.get("instruments") or []:
             if raw.get("type") == "CURRENCY" and raw.get("name"):
-                specs.append(
-                    InstrumentSpec(
-                        name=str(raw["name"]),
-                        pip_location=int(raw["pipLocation"]),
-                        display_precision=int(raw["displayPrecision"]),
-                        trade_units_precision=int(raw.get("tradeUnitsPrecision") or 0),
-                        minimum_trade_size=Decimal(str(raw.get("minimumTradeSize") or "1")),
-                        maximum_order_units=Decimal(str(raw.get("maximumOrderUnits") or "0")),
-                    )
-                )
+                specs.append(InstrumentSpec(
+                    name=str(raw["name"]),
+                    pip_location=int(raw["pipLocation"]),
+                    display_precision=int(raw["displayPrecision"]),
+                    trade_units_precision=int(raw.get("tradeUnitsPrecision") or 0),
+                    minimum_trade_size=Decimal(str(raw.get("minimumTradeSize") or "1")),
+                    maximum_order_units=Decimal(str(raw.get("maximumOrderUnits") or "0")),
+                ))
         return specs
 
-    def open_instruments(self) -> set[str]:
+    def open_trades(self) -> list[dict]:
         data = self._request("GET", self._account_path("/openTrades"))
-        return {str(t["instrument"]) for t in (data.get("trades") or []) if isinstance(t, dict)}
+        return [t for t in (data.get("trades") or []) if isinstance(t, dict)]
 
     def market_data(self, spec: InstrumentSpec) -> dict | None:
         candles = self._request(
@@ -477,10 +520,9 @@ class OandaBroker:
             return None
         return build_market_snapshot(spec, candles.get("candles") or [], prices[0])
 
-    def account_summary(self) -> tuple[Any, Any, Any]:
+    def account_summary(self) -> dict:
         data = self._request("GET", self._account_path("/summary"))
-        acc = data.get("account") or {}
-        return acc.get("balance", "N/A"), acc.get("unrealizedPL", "N/A"), acc.get("openTradeCount", 0)
+        return data.get("account") or {}
 
     def submit(self, spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, tp_pips: float, md: dict):
         built = build_order(spec, direction, units, sl_pips, tp_pips, md)
@@ -490,12 +532,25 @@ class OandaBroker:
         return status, entry, stop, target, reason
 
 
-def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
+def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn, settings: Settings) -> ScanResult:
     try:
         instruments = broker.list_instruments()
-        open_instruments = broker.open_instruments()
+        trades = broker.open_trades()
+        account = broker.account_summary()
     except Exception as exc:
         return ScanResult(report=f"Scan failed: {exc}", failed=1, alert=True)
+
+    # Daily loss check uses the account's unrealized P&L plus realized P&L for today's trades.
+    daily_pnl = Decimal(str(account.get("unrealizedPL", "0")))
+    try:
+        daily_pnl += Decimal(str(account.get("pl", "0")))
+    except Exception:
+        pass
+
+    open_instruments = {str(t["instrument"]) for t in trades}
+    open_currencies: set[str] = set()
+    for name in open_instruments:
+        open_currencies.update(name.split("_", 1))
 
     reports: list[str] = []
     executed, failed = 0, 0
@@ -506,21 +561,29 @@ def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
             md = broker.market_data(spec)
             if not md or not md.get("tradeable"):
                 continue
-            signal = evaluate_rules(md)
+            signal = evaluate_rules(md, float(spec.pip))
             if not signal.get("should_trade"):
                 continue
+
             opinion = opinion_fn(spec.pair, md, signal)
+            block = guardrail_block(spec.pair, signal["direction"], opinion, open_instruments,
+                                    open_currencies, settings, md["spread_pips"], daily_pnl, spec)
+            if block:
+                logger.info("Blocked %s %s: %s", spec.pair, signal["direction"], block)
+                reports.append(f"BLOCKED ({spec.pair} {signal['direction']}): {block}")
+                continue
+
             status, entry, stop, target, reason = broker.submit(
-                spec, signal["direction"], units, float(signal["sl_pips"]), float(signal["tp_pips"]), md
-            )
+                spec, signal["direction"], units, float(signal["sl_pips"]), float(signal["tp_pips"]), md)
             if status == "filled":
                 executed += 1
+                open_instruments.add(spec.name)
+                open_currencies.update(spec.currencies)
                 reports.append(
                     f"TRADE EXECUTED ({spec.pair})\n"
                     f"Direction: {signal['direction']} @ {format_decimal(entry)}\n"
                     f"SL: {format_decimal(stop)} | TP: {format_decimal(target)}\n"
-                    f"{ai_note(opinion)}"
-                )
+                    f"{ai_note(opinion)}")
             else:
                 failed += 1
                 reports.append(f"ORDER FAILED ({spec.pair}): {reason}")
@@ -537,10 +600,7 @@ def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
         return ScanResult(report=note, executed=0, failed=failed, alert=False)
     return ScanResult(
         report=f"--- SCAN COMPLETED ({executed} opened) ---\n\n" + "\n\n".join(reports),
-        executed=executed,
-        failed=failed,
-        alert=True,
-    )
+        executed=executed, failed=failed, alert=True)
 
 
 @asynccontextmanager
@@ -558,7 +618,8 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.bot = bot
     app.state.broker = broker
-    app.state.opinion_fn = lambda p, m, s: get_openrouter_opinion(ai_client, settings.openrouter_model, p, m, s)
+    app.state.opinion_fn = lambda p, m, s: get_openrouter_opinion(
+        ai_client, settings.openrouter_model, p, m, s)
 
     await bot.initialize()
     if settings.public_url:
@@ -578,7 +639,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-# Defaults so handlers never hit AttributeError if config failed to load.
 app.state.settings = None
 app.state.bot = None
 app.state.broker = None
@@ -605,14 +665,13 @@ async def say(text: str, chat_id: str | None = None) -> None:
 
 
 async def run_scan() -> ScanResult | None:
-    """Run one scan in a worker thread. Returns None if a scan is already running."""
     if app.state.scanning:
         return None
     app.state.scanning = True
     try:
         return await asyncio.to_thread(
-            run_cycle, app.state.broker, app.state.settings.trade_units, app.state.opinion_fn
-        )
+            run_cycle, app.state.broker, app.state.settings.trade_units,
+            app.state.opinion_fn, app.state.settings)
     finally:
         app.state.scanning = False
 
@@ -620,28 +679,29 @@ async def run_scan() -> ScanResult | None:
 async def handle_command(cmd: str) -> None:
     try:
         if cmd in ("/start", "/help"):
-            await say(
-                "Tris Bot Active (ATR + OpenRouter)\n\n"
-                "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/pause - pause\n/resume - resume"
-            )
+            await say("Tris Bot Active (guarded)\n\n/status - state & limits\n/debug - dry run EUR/USD\n"
+                      "/trade - scan & execute\n/pause - pause\n/resume - resume\n/id - show this chat's ID")
         elif cmd == "/status":
-            bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
+            acc = await asyncio.to_thread(app.state.broker.account_summary)
+            s = app.state.settings
             state = "PAUSED" if app.state.paused else "RUNNING"
-            await say(f"STATUS ({state}, {app.state.settings.oanda_env})\nBalance: {bal}\nPnL: {pnl}\nOpen Trades: {count}")
+            await say(f"STATUS ({state}, {s.oanda_env})\nBalance: {acc.get('balance', 'N/A')}\n"
+                      f"PnL: {acc.get('unrealizedPL', 'N/A')}\n"
+                      f"Open trades: {acc.get('openTradeCount', 0)} / max {s.max_open_trades}\n"
+                      f"Daily loss limit: {s.daily_loss_limit}\nAI blocks on disagree: {s.ai_blocks_on_disagree}\n"
+                      f"AI required: {s.ai_required}")
         elif cmd == "/debug":
             await say("Running debug test on EUR/USD...")
             instruments = await asyncio.to_thread(app.state.broker.list_instruments)
-            spec = next(
-                (i for i in instruments if i.name == "EUR_USD"),
-                InstrumentSpec("EUR_USD", -4, 5, 0, Decimal("1"), Decimal("0")),
-            )
+            spec = next((i for i in instruments if i.name == "EUR_USD"),
+                        InstrumentSpec("EUR_USD", -4, 5, 0, Decimal("1"), Decimal("0")))
             md = await asyncio.to_thread(app.state.broker.market_data, spec)
             if not md:
                 await say("Debug Error: Could not fetch EUR_USD data.")
             else:
-                signal = evaluate_rules(md)
-                await say(f"DEBUG EUR/USD:\nClose: {md['last_closes'][-1]}\nATR: {md['atr']:.5f}\nSignal: {json.dumps(signal)}")
+                signal = evaluate_rules(md, float(spec.pip))
+                await say(f"DEBUG EUR/USD:\nClose: {md['last_closes'][-1]}\nATR: {md['atr']:.5f}\n"
+                          f"Spread: {md['spread_pips']:.1f} pips\nSignal: {json.dumps(signal)}")
         elif cmd == "/pause":
             app.state.paused = True
             await say("Trading paused.")
@@ -655,8 +715,10 @@ async def handle_command(cmd: str) -> None:
             await say("Manual scan triggered...")
             result = await run_scan()
             await say("A scan is already running." if result is None else result.report)
+        elif cmd == "/id":
+            await say("Use the chat ID from the unauthorized log line if this is not your chat.")
         else:
-            await say(f"Unknown command: {cmd}\nSend /help for the list.")
+            await say(f"Unknown command: {cmd}\nSend /start for the list.")
     except Exception as exc:
         logger.exception("Error executing command handler")
         await say(f"Error: {exc}")
@@ -696,19 +758,13 @@ async def telegram_webhook(request: Request):
     cmd = parse_command(str(msg.get("text") or ""))
 
     if sender_chat_id != settings.telegram_chat_id:
-        logger.warning(
-            "UNAUTHORIZED chat rejected: incoming chat id [%s] != TELEGRAM_CHAT_ID [%s]",
-            sender_chat_id,
-            settings.telegram_chat_id,
-        )
-        if cmd == "/id":  # lets you discover the right chat id to put in TELEGRAM_CHAT_ID
+        logger.warning("UNAUTHORIZED chat rejected: incoming chat id [%s] != TELEGRAM_CHAT_ID [%s]",
+                       sender_chat_id, settings.telegram_chat_id)
+        if cmd == "/id":
             await say(f"This chat's ID is: {sender_chat_id}", chat_id=sender_chat_id)
         return {"status": "unauthorized"}
 
     logger.info("Command received: %s", cmd)
-
-    # Reply to Telegram immediately; long work (scans) runs in the background so
-    # Telegram doesn't time out and retry the webhook.
     task = asyncio.create_task(handle_command(cmd))
     app.state.tasks.add(task)
     task.add_done_callback(app.state.tasks.discard)
