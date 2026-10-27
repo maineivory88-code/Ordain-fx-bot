@@ -737,4 +737,4 @@ async def run_agent_check(request: Request, key: str = ""):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))c
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
