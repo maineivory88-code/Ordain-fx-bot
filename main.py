@@ -11,9 +11,11 @@ import re
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -58,6 +60,8 @@ class Settings:
     breakeven_lock_pips: Decimal = Decimal("1")
     trail_pips: Decimal = Decimal("0")
     protect_interval: int = 60
+    daily_profit_target: Decimal = Decimal("10")
+    daily_loss_limit: Decimal = Decimal("20")
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,22 @@ class SkipPair(Exception):
 OpinionFn = Callable[[str, dict, dict], dict | None]
 
 
+def trading_day_start(now: datetime | None = None) -> datetime:
+    """Start of the current forex trading day (17:00 New York), as a UTC datetime."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    try:
+        local = now.astimezone(ZoneInfo("America/New_York"))
+        start = local.replace(hour=17, minute=0, second=0, microsecond=0)
+        if local < start:
+            start -= timedelta(days=1)
+        return start.astimezone(timezone.utc)
+    except Exception:  # tz database missing: approximate with 22:00 UTC
+        start = now.replace(hour=22, minute=0, second=0, microsecond=0)
+        if now < start:
+            start -= timedelta(days=1)
+        return start
+
+
 def env_decimal(name: str, default: str) -> Decimal:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -113,7 +133,7 @@ def load_settings() -> Settings:
         raise RuntimeError("OANDA_ENV must be 'practice' or 'live'")
     host = "api-fxpractice.oanda.com" if oanda_env == "practice" else "api-fxtrade.oanda.com"
 
-    units_raw = os.getenv("TRADE_UNITS", "1000").strip()
+    units_raw = os.getenv("TRADE_UNITS", "5000").strip()
     try:
         units = Decimal(units_raw)
     except Exception as exc:
@@ -137,6 +157,14 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise RuntimeError("PROTECT_INTERVAL_SECONDS must be an integer") from exc
 
+    daily_target = env_decimal("DAILY_PROFIT_TARGET", "10")
+    if daily_target < 0:
+        raise RuntimeError("DAILY_PROFIT_TARGET cannot be negative")
+
+    daily_loss = env_decimal("DAILY_LOSS_LIMIT", "20")
+    if daily_loss < 0:
+        raise RuntimeError("DAILY_LOSS_LIMIT cannot be negative")
+
     public_url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
     return Settings(
         telegram_token=os.environ["TELEGRAM_TOKEN"].strip(),
@@ -155,6 +183,8 @@ def load_settings() -> Settings:
         breakeven_lock_pips=be_lock,
         trail_pips=trail,
         protect_interval=interval,
+        daily_profit_target=daily_target,
+        daily_loss_limit=daily_loss,
     )
 
 
@@ -512,6 +542,86 @@ class OandaBroker:
             return None
         return build_market_snapshot(spec, candles.get("candles") or [], prices[0])
 
+    def realized_pl_since(self, since: datetime) -> Decimal:
+        """Sum realized P/L (incl. financing and commission) from fills since `since`."""
+        fmt = "%Y-%m-%dT%H:%M:%S.000000000Z"
+        params = {
+            "from": since.strftime(fmt),
+            "to": datetime.now(timezone.utc).strftime(fmt),
+            "type": "ORDER_FILL",
+            "pageSize": 1000,
+        }
+        index = self._request("GET", self._account_path("/transactions"), params=params)
+        total = Decimal("0")
+        for page_url in index.get("pages") or []:
+            resp = self.session.get(page_url, timeout=20)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"OANDA HTTP {resp.status_code}: {resp.text[:180]}")
+            for tx in resp.json().get("transactions") or []:
+                for key in ("pl", "financing", "commission"):
+                    try:
+                        total += Decimal(str(tx.get(key) or "0"))
+                    except Exception:
+                        pass
+        return total
+
+    def daily_pnl(self) -> tuple[Decimal, Decimal]:
+        """Return (realized today, unrealized now) in account currency."""
+        realized = self.realized_pl_since(trading_day_start())
+        data = self._request("GET", self._account_path("/summary"))
+        unrealized = Decimal(str((data.get("account") or {}).get("unrealizedPL", "0")))
+        return realized, unrealized
+
+    def close_winning_trades(self) -> tuple[list[tuple[str, str]], list[str], int]:
+        """Close every trade currently in profit. Returns ([(instrument, label)], failed, kept)."""
+        data = self._request("GET", self._account_path("/openTrades"))
+        closed: list[tuple[str, str]] = []
+        failed: list[str] = []
+        kept = 0
+        for trade in data.get("trades") or []:
+            if not isinstance(trade, dict):
+                continue
+            try:
+                pl = Decimal(str(trade.get("unrealizedPL", "0")))
+            except Exception:
+                continue
+            trade_id = str(trade.get("id"))
+            instrument = str(trade.get("instrument", "?"))
+            label = f"{instrument.replace('_', '/')} #{trade_id}"
+            if pl <= 0:
+                kept += 1
+                continue
+            try:
+                self._request(
+                    "PUT",
+                    self._account_path(f"/trades/{quote(trade_id, safe='')}/close"),
+                    json={"units": "ALL"},
+                )
+                closed.append((instrument, f"{label} (+{format_decimal(pl)})"))
+            except Exception as exc:
+                failed.append(f"{label}: {exc}")
+        return closed, failed, kept
+
+    def close_all_trades(self) -> tuple[list[str], list[str]]:
+        data = self._request("GET", self._account_path("/openTrades"))
+        closed: list[str] = []
+        failed: list[str] = []
+        for trade in data.get("trades") or []:
+            if not isinstance(trade, dict):
+                continue
+            trade_id = str(trade.get("id"))
+            label = f"{str(trade.get('instrument', '?')).replace('_', '/')} #{trade_id}"
+            try:
+                self._request(
+                    "PUT",
+                    self._account_path(f"/trades/{quote(trade_id, safe='')}/close"),
+                    json={"units": "ALL"},
+                )
+                closed.append(label)
+            except Exception as exc:
+                failed.append(f"{label}: {exc}")
+        return closed, failed
+
     def protect_trades(self) -> list[str]:
         """Move stops to break-even (+lock) once a trade is in profit; optional trailing stop."""
         s = self.settings
@@ -622,7 +732,7 @@ class OandaBroker:
         return status, entry, stop, target, reason
 
 
-def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
+def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn, skip_instruments: set[str] | None = None) -> ScanResult:
     try:
         instruments = broker.list_instruments()
         open_instruments = broker.open_instruments()
@@ -632,7 +742,7 @@ def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn) -> ScanResult:
     reports: list[str] = []
     executed, failed = 0, 0
     for spec in instruments:
-        if spec.name in open_instruments:
+        if spec.name in open_instruments or (skip_instruments and spec.name in skip_instruments):
             continue
         try:
             md = broker.market_data(spec)
@@ -705,7 +815,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("PUBLIC_URL is not set: Telegram webhook NOT registered, bot will not receive commands")
     protect_task = None
-    if settings.protect_interval > 0 and settings.breakeven_trigger_pips > 0:
+    if settings.protect_interval > 0 and (settings.breakeven_trigger_pips > 0 or settings.daily_profit_target > 0):
         protect_task = asyncio.create_task(protect_loop())
     yield
     if protect_task:
@@ -724,6 +834,8 @@ app.state.paused = False
 app.state.scanning = False
 app.state.seen_updates = OrderedDict()
 app.state.tasks = set()
+app.state.target_day = None  # trading-day key on which trading was stopped (target or loss limit)
+app.state.stop_reason = ""
 
 
 async def protect_loop() -> None:
@@ -731,6 +843,9 @@ async def protect_loop() -> None:
     while True:
         await asyncio.sleep(app.state.settings.protect_interval)
         try:
+            target_msg = await check_daily_target()
+            if target_msg:
+                await say(target_msg)
             notes = await asyncio.to_thread(app.state.broker.protect_trades)
             if notes:
                 await say("\n".join(notes))
@@ -755,14 +870,51 @@ async def say(text: str, chat_id: str | None = None) -> None:
         await asyncio.sleep(0.3)
 
 
-async def run_scan() -> ScanResult | None:
+async def check_daily_target() -> str | None:
+    """Stop trading for the day (and close everything) at the profit target or the loss limit."""
+    settings = app.state.settings
+    if not settings or (settings.daily_profit_target <= 0 and settings.daily_loss_limit <= 0):
+        return None
+    day_key = trading_day_start().isoformat()
+    if app.state.target_day == day_key:
+        return None
+    realized, unrealized = await asyncio.to_thread(app.state.broker.daily_pnl)
+    total = realized + unrealized
+    if settings.daily_profit_target > 0 and total >= settings.daily_profit_target:
+        reason = "profit target"
+        headline = f"DAILY TARGET HIT: {total:.2f} >= {settings.daily_profit_target}."
+    elif settings.daily_loss_limit > 0 and total <= -settings.daily_loss_limit:
+        reason = "loss limit"
+        headline = f"DAILY LOSS LIMIT HIT: {total:.2f} <= -{settings.daily_loss_limit}."
+    else:
+        return None
+    closed, failed = await asyncio.to_thread(app.state.broker.close_all_trades)
+    if failed:  # keep the flag unset so the next check retries
+        return headline + " Some closes failed:\n" + "\n".join(failed)
+    app.state.target_day = day_key
+    app.state.stop_reason = reason
+    return (
+        f"{headline} Closed {len(closed)} trade(s). "
+        "No new trades until the next trading day (17:00 New York)."
+    )
+
+
+async def run_scan(skip: set[str] | None = None) -> ScanResult | None:
     """Run one scan in a worker thread. Returns None if a scan is already running."""
+    try:
+        target_msg = await check_daily_target()
+        if target_msg:
+            await say(target_msg)
+    except Exception:
+        logger.exception("Daily target check failed")
+    if app.state.target_day == trading_day_start().isoformat():
+        return ScanResult(report=f"Daily {app.state.stop_reason} reached; no new trades until the next trading day.")
     if app.state.scanning:
         return None
     app.state.scanning = True
     try:
         return await asyncio.to_thread(
-            run_cycle, app.state.broker, app.state.settings.trade_units, app.state.opinion_fn
+            run_cycle, app.state.broker, app.state.settings.trade_units, app.state.opinion_fn, skip
         )
     finally:
         app.state.scanning = False
@@ -774,7 +926,7 @@ async def handle_command(cmd: str) -> None:
             await say(
                 "Tris Bot Active (ATR + OpenRouter)\n\n"
                 "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
+                "/target - today's profit vs target\n/takeprofit - close all winners, then rescan\n/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
@@ -793,6 +945,32 @@ async def handle_command(cmd: str) -> None:
             else:
                 signal = evaluate_rules(md)
                 await say(f"DEBUG EUR/USD:\nClose: {md['last_closes'][-1]}\nATR: {md['atr']:.5f}\nSignal: {json.dumps(signal)}")
+        elif cmd == "/target":
+            settings_ = app.state.settings
+            realized, unrealized = await asyncio.to_thread(app.state.broker.daily_pnl)
+            hit = app.state.target_day == trading_day_start().isoformat()
+            await say(
+                f"DAILY PROGRESS\nRealized: {realized:.2f}\nUnrealized: {unrealized:.2f}\n"
+                f"Total: {realized + unrealized:.2f}\nTarget: +{settings_.daily_profit_target} | Loss limit: -{settings_.daily_loss_limit}\n"
+                + (f"Trading stopped for today ({app.state.stop_reason})." if hit else "Trading active.")
+            )
+        elif cmd in ("/takeprofit", "/takeprofits"):
+            await say("Taking profit on all winning trades...")
+            closed, failed, kept = await asyncio.to_thread(app.state.broker.close_winning_trades)
+            lines = [f"TOOK PROFIT on {len(closed)} trade(s); {kept} trade(s) not in profit left open."]
+            if closed:
+                lines.append("\n".join(label for _, label in closed))
+            if failed:
+                lines.append("FAILED:\n" + "\n".join(failed))
+            await say("\n".join(lines))
+            if not closed:
+                return
+            if app.state.paused:
+                await say("Trading is paused, so no new trades were opened. Send /resume to scan again.")
+                return
+            await say("Scanning for new setups (skipping the pairs just closed)...")
+            result = await run_scan(skip={name for name, _ in closed})
+            await say("A scan is already running." if result is None else result.report)
         elif cmd == "/protect":
             notes = await asyncio.to_thread(app.state.broker.protect_trades)
             await say("\n".join(notes) if notes else "No trades needed protection right now.")
