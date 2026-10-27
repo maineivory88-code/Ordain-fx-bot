@@ -12,7 +12,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -62,6 +62,10 @@ class Settings:
     protect_interval: int = 60
     cycle_target: Decimal = Decimal("20")
     daily_loss_limit: Decimal = Decimal("150")
+    trade_instruments: frozenset = frozenset(("EUR_USD", "GBP_USD", "GBP_JPY", "XAU_USD", "USD_JPY"))
+    xau_risk_usd: Decimal = Decimal("20")
+    gold_sl_atr: Decimal = Decimal("1.5")
+    gold_tp_atr: Decimal = Decimal("3")
     trading_session: str = "all"
 
 
@@ -193,6 +197,18 @@ def load_settings() -> Settings:
     loss_limit = env_decimal("DAILY_LOSS_LIMIT", "150")
     if loss_limit < 0:
         raise RuntimeError("DAILY_LOSS_LIMIT cannot be negative (use 0 to turn it off)")
+    raw_instruments = os.getenv("TRADE_INSTRUMENTS", "").strip()
+    if raw_instruments:
+        instruments = frozenset(x.strip().upper() for x in raw_instruments.split(",") if x.strip())
+    else:
+        instruments = frozenset(("EUR_USD", "GBP_USD", "GBP_JPY", "XAU_USD", "USD_JPY"))
+    if not all(re.fullmatch(r"[A-Z]{3}_[A-Z]{3}", i) for i in instruments):
+        raise RuntimeError("TRADE_INSTRUMENTS must look like EUR_USD,GBP_USD,...")
+    xau_risk = env_decimal("XAU_RISK_USD", "20")
+    gold_sl = env_decimal("GOLD_SL_ATR", "1.5")
+    gold_tp = env_decimal("GOLD_TP_ATR", "3")
+    if xau_risk <= 0 or gold_sl <= 0 or gold_tp <= 0:
+        raise RuntimeError("XAU_RISK_USD, GOLD_SL_ATR and GOLD_TP_ATR must be greater than 0")
     session = os.getenv("TRADING_SESSION", "all").strip().lower()
     if session not in SESSION_WINDOWS_UTC:
         raise RuntimeError("TRADING_SESSION must be one of: " + ", ".join(SESSION_WINDOWS_UTC))
@@ -217,6 +233,10 @@ def load_settings() -> Settings:
         protect_interval=interval,
         cycle_target=cycle,
         daily_loss_limit=loss_limit,
+        trade_instruments=instruments,
+        xau_risk_usd=xau_risk,
+        gold_sl_atr=gold_sl,
+        gold_tp_atr=gold_tp,
         trading_session=session,
     )
 
@@ -387,20 +407,43 @@ def order_units(units: Decimal, direction: str, spec: InstrumentSpec) -> str:
     return format_decimal(sized)
 
 
-def build_order(spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, tp_pips: float, md: dict) -> dict:
+def build_order(
+    spec: InstrumentSpec,
+    direction: str,
+    units: Decimal,
+    sl_pips: float,
+    tp_pips: float,
+    md: dict,
+    settings: Settings,
+) -> dict:
     entry_key = "ask" if direction == "BUY" else "bid"
     entry = Decimal(md[entry_key])
-    stop, target = protective_prices(
-        entry,
-        direction,
-        Decimal(str(sl_pips)),
-        Decimal(str(tp_pips)),
-        spec.pip,
-        spec.display_precision,
-    )
+    quantum = price_quantum(spec.display_precision)
+    if spec.name == "XAU_USD":
+        # Gold: stops and targets are multiples of ATR (in dollars), and size is set so
+        # a stop-out costs about XAU_RISK_USD.
+        atr = Decimal(str(md["atr"]))
+        sl_dist = (settings.gold_sl_atr * atr).quantize(quantum, rounding=ROUND_HALF_UP)
+        tp_dist = (settings.gold_tp_atr * atr).quantize(quantum, rounding=ROUND_HALF_UP)
+        if sl_dist <= 0 or tp_dist <= 0:
+            raise SkipPair("gold ATR distance rounded to zero")
+        oz = (settings.xau_risk_usd / sl_dist).quantize(price_quantum(spec.trade_units_precision), rounding=ROUND_DOWN)
+        units_str = order_units(oz, direction, spec)  # raises SkipPair if below minimum
+    else:
+        sl_dist = (Decimal(str(sl_pips)) * spec.pip).quantize(quantum, rounding=ROUND_HALF_UP)
+        tp_dist = (Decimal(str(tp_pips)) * spec.pip).quantize(quantum, rounding=ROUND_HALF_UP)
+        if sl_dist <= 0 or tp_dist <= 0:
+            raise ValueError("SL/TP distance rounded to zero")
+        units_str = order_units(units, direction, spec)
+    if direction == "BUY":
+        stop, target = entry - sl_dist, entry + tp_dist
+    else:
+        stop, target = entry + sl_dist, entry - tp_dist
+    stop = stop.quantize(quantum, rounding=ROUND_HALF_UP)
+    target = target.quantize(quantum, rounding=ROUND_HALF_UP)
     return {
         "order": {
-            "units": order_units(units, direction, spec),
+            "units": units_str,
             "instrument": spec.name,
             "timeInForce": "FOK",
             "type": "MARKET",
@@ -487,31 +530,42 @@ def build_market_snapshot(spec: InstrumentSpec, candles: list[dict], price: dict
     }
 
 
+def _short_error(exc: Exception) -> str:
+    text = str(exc) or exc.__class__.__name__
+    return text[:160]
+
+
 def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule_signal: dict) -> dict | None:
     prompt = (
         f"Review trade signal for {pair}.\nSignal: {json.dumps(rule_signal)}\nData: {json.dumps(md)}\n"
         'Return JSON only: {"agree": true, "comment": "short text"}'
     )
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a financial JSON generator."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content or ""
-        data = extract_json(content)
-        return {"agree": data.get("agree", True), "comment": str(data.get("comment", "N/A"))[:500]}
-    except Exception as exc:
-        logger.warning("OpenRouter opinion skipped for %s: %r", pair, exc)
-        return None
+    messages = [
+        {"role": "system", "content": "You are a financial JSON generator."},
+        {"role": "user", "content": prompt},
+    ]
+    last_error: Exception | None = None
+    # Some OpenRouter models reject JSON mode; if so, retry as plain text and parse the JSON.
+    for json_mode in (True, False):
+        try:
+            kwargs: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": 300}
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = client.chat.completions.create(**kwargs)
+            content = response.choices[0].message.content or ""
+            data = extract_json(content)
+            return {"agree": data.get("agree", True), "comment": str(data.get("comment", "N/A"))[:500]}
+        except Exception as exc:
+            last_error = exc
+            logger.warning("OpenRouter attempt (json_mode=%s) failed for %s: %r", json_mode, pair, exc)
+    return {"agree": True, "comment": "", "error": _short_error(last_error) if last_error else "unknown"}
 
 
 def ai_note(opinion: dict | None) -> str:
     if not opinion:
         return "OpenRouter AI: Offline / Skipped"
+    if opinion.get("error"):
+        return f"OpenRouter AI: Offline - {opinion['error']}"
     agree = not explicit_disagree(opinion)
     return f"OpenRouter AI: {'Agree' if agree else 'Caution'} - {opinion.get('comment', 'N/A')}"
 
@@ -546,7 +600,8 @@ class OandaBroker:
         data = self._request("GET", self._account_path("/instruments"))
         specs = []
         for raw in data.get("instruments") or []:
-            if raw.get("type") == "CURRENCY" and raw.get("name"):
+            name = str(raw.get("name") or "")
+            if raw.get("type") in ("CURRENCY", "METAL") and name in self.settings.trade_instruments:
                 specs.append(
                     InstrumentSpec(
                         name=str(raw["name"]),
@@ -688,12 +743,23 @@ class OandaBroker:
                 entry = Decimal(str(t["price"]))
                 is_long = Decimal(str(t["currentUnits"])) > 0
                 pip = spec.pip
-                profit_pips = ((bid - entry) if is_long else (entry - ask)) / pip
-                if profit_pips < s.breakeven_trigger_pips:
-                    continue
-
+                move = (bid - entry) if is_long else (entry - ask)
+                profit_pips = move / pip
+                is_gold = name == "XAU_USD"
                 quantum = price_quantum(spec.display_precision)
-                lock = s.breakeven_lock_pips * pip
+                if is_gold:
+                    # Gold: break-even once profit reaches 1R (the stop distance), locking one tick.
+                    sl_raw = t.get("stopLossOrder")
+                    if not isinstance(sl_raw, dict) or not sl_raw.get("price"):
+                        continue
+                    risk = abs(entry - Decimal(str(sl_raw["price"])))
+                    if risk <= 0 or move < risk:
+                        continue
+                    lock = pip
+                else:
+                    if profit_pips < s.breakeven_trigger_pips:
+                        continue
+                    lock = s.breakeven_lock_pips * pip
                 raw_sl = entry + lock if is_long else entry - lock
                 target_sl = raw_sl.quantize(quantum, rounding=ROUND_HALF_UP)
                 current_sl = None
@@ -705,7 +771,7 @@ class OandaBroker:
                 body: dict[str, Any] = {}
                 if improves:
                     body["stopLoss"] = {"price": format_decimal(target_sl)}
-                if s.trail_pips > 0 and not t.get("trailingStopLossOrder") and profit_pips > s.trail_pips:
+                if s.trail_pips > 0 and not is_gold and not t.get("trailingStopLossOrder") and profit_pips > s.trail_pips:
                     dist = (s.trail_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
                     body["trailingStopLoss"] = {"distance": format_decimal(dist)}
                 if not body:
@@ -758,7 +824,7 @@ class OandaBroker:
         return acc.get("balance", "N/A"), acc.get("unrealizedPL", "N/A"), acc.get("openTradeCount", 0)
 
     def submit(self, spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, tp_pips: float, md: dict):
-        built = build_order(spec, direction, units, sl_pips, tp_pips, md)
+        built = build_order(spec, direction, units, sl_pips, tp_pips, md, self.settings)
         entry, stop, target = built.pop("_entry"), built.pop("_stop"), built.pop("_target")
         response = self._request("POST", self._account_path("/orders"), json=built)
         status, reason = interpret_order_response(response)
@@ -833,6 +899,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.bot = bot
     app.state.broker = broker
+    app.state.ai_client = ai_client
     app.state.opinion_fn = lambda p, m, s: get_openrouter_opinion(ai_client, settings.openrouter_model, p, m, s)
 
     await bot.initialize()
@@ -867,6 +934,7 @@ app.state.paused = False
 app.state.scanning = False
 app.state.seen_updates = OrderedDict()
 app.state.milestone_day = None
+app.state.ai_client = None
 app.state.milestone = 0
 app.state.loss_alert_day = None  # trading day on which the loss alert was sent
 app.state.tasks = set()
@@ -984,7 +1052,7 @@ async def handle_command(cmd: str) -> None:
             await say(
                 "Tris Bot Active (ATR + OpenRouter)\n\n"
                 "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/target - today's P/L and next profit step\n/takeprofit - close all winners, then rescan\n/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
+                "/target - today's P/L and next profit step\n/takeprofit - close all winners, then rescan\n/ai - test OpenRouter connection\n/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
@@ -1031,6 +1099,24 @@ async def handle_command(cmd: str) -> None:
             await say("Scanning for new setups (skipping the pairs just closed)...")
             result = await run_scan(skip={name for name, _ in closed})
             await say("A scan is already running." if result is None else result.report)
+        elif cmd == "/ai":
+            client = app.state.ai_client
+            if client is None:
+                await say("OpenRouter client is not loaded. Check OPENROUTER_API_KEY in Render.")
+            else:
+                model = app.state.settings.openrouter_model
+                try:
+                    resp = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=model,
+                        messages=[{"role": "user", "content": "Reply with the single word OK."}],
+                        max_tokens=10,
+                    )
+                    text = (resp.choices[0].message.content or "").strip()
+                    await say(f"OpenRouter ONLINE\nModel: {model}\nReply: {text[:100]}")
+                except Exception as exc:
+                    await say(f"OpenRouter OFFLINE\nModel: {model}\nError: {_short_error(exc)}\n"
+                              "If it says 401, the key is wrong. If 404 or model not found, set OPENROUTER_MODEL in Render.")
         elif cmd == "/protect":
             notes = await asyncio.to_thread(app.state.broker.protect_trades)
             await say("\n".join(notes) if notes else "No trades needed protection right now.")
