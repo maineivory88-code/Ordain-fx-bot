@@ -477,6 +477,35 @@ class OandaBroker:
             return None
         return build_market_snapshot(spec, candles.get("candles") or [], prices[0])
 
+    def close_losing_trades(self) -> tuple[list[str], list[str], int]:
+        """Close every open trade with negative unrealized P/L. Returns (closed, failed, kept)."""
+        data = self._request("GET", self._account_path("/openTrades"))
+        closed: list[str] = []
+        failed: list[str] = []
+        kept = 0
+        for trade in data.get("trades") or []:
+            if not isinstance(trade, dict):
+                continue
+            try:
+                pl = Decimal(str(trade.get("unrealizedPL", "0")))
+            except Exception:
+                continue
+            trade_id = str(trade.get("id"))
+            label = f"{str(trade.get('instrument', '?')).replace('_', '/')} #{trade_id}"
+            if pl >= 0:
+                kept += 1
+                continue
+            try:
+                self._request(
+                    "PUT",
+                    self._account_path(f"/trades/{quote(trade_id, safe='')}/close"),
+                    json={"units": "ALL"},
+                )
+                closed.append(f"{label} ({format_decimal(pl)})")
+            except Exception as exc:
+                failed.append(f"{label}: {exc}")
+        return closed, failed, kept
+
     def account_summary(self) -> tuple[Any, Any, Any]:
         data = self._request("GET", self._account_path("/summary"))
         acc = data.get("account") or {}
@@ -623,7 +652,7 @@ async def handle_command(cmd: str) -> None:
             await say(
                 "Tris Bot Active (ATR + OpenRouter)\n\n"
                 "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/pause - pause\n/resume - resume"
+                "/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
@@ -642,6 +671,15 @@ async def handle_command(cmd: str) -> None:
             else:
                 signal = evaluate_rules(md)
                 await say(f"DEBUG EUR/USD:\nClose: {md['last_closes'][-1]}\nATR: {md['atr']:.5f}\nSignal: {json.dumps(signal)}")
+        elif cmd in ("/closelosers", "/closelosses"):
+            await say("Closing all losing trades...")
+            closed, failed, kept = await asyncio.to_thread(app.state.broker.close_losing_trades)
+            lines = [f"CLOSED {len(closed)} losing trade(s); kept {kept} winner(s)."]
+            if closed:
+                lines.append("\n".join(closed))
+            if failed:
+                lines.append("FAILED:\n" + "\n".join(failed))
+            await say("\n".join(lines))
         elif cmd == "/pause":
             app.state.paused = True
             await say("Trading paused.")
