@@ -255,6 +255,11 @@ def parse_command(text: str) -> str:
     return token.split("@", 1)[0].lower()
 
 
+def parse_args(text: str) -> list[str]:
+    parts = text.strip().split()
+    return parts[1:] if len(parts) > 1 else []
+
+
 def chunk_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     text = text or ""
     if len(text) <= limit:
@@ -570,6 +575,77 @@ def ai_note(opinion: dict | None) -> str:
     return f"OpenRouter AI: {'Agree' if agree else 'Caution'} - {opinion.get('comment', 'N/A')}"
 
 
+def _money(x: Decimal) -> str:
+    return f"{x:+.2f}"
+
+
+def compute_stats(trades: list[dict], days: int, now: datetime | None = None) -> str:
+    """Summarize closed trades from the last `days` days. Net = realized P/L + financing."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    wins: list[Decimal] = []
+    losses: list[Decimal] = []
+    flat = 0
+    per_day: dict[str, list] = {}
+    per_pair: dict[str, list] = {}
+    for t in trades:
+        try:
+            closed = datetime.strptime(str(t["closeTime"])[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            net = Decimal(str(t.get("realizedPL") or "0")) + Decimal(str(t.get("financing") or "0"))
+        except Exception:
+            continue
+        if closed < cutoff:
+            continue
+        if net > 0:
+            wins.append(net)
+        elif net < 0:
+            losses.append(net)
+        else:
+            flat += 1
+        day = trading_day_start(closed).date().isoformat()
+        row = per_day.setdefault(day, [Decimal(0), 0])
+        row[0] += net
+        row[1] += 1
+        pair = str(t.get("instrument", "?")).replace("_", "/")
+        row = per_pair.setdefault(pair, [Decimal(0), 0])
+        row[0] += net
+        row[1] += 1
+
+    total = len(wins) + len(losses) + flat
+    if total == 0:
+        return f"STATS (last {days} days)\nNo closed trades in this period."
+
+    gross_win = sum(wins, Decimal(0))
+    gross_loss = -sum(losses, Decimal(0))
+    win_rate = len(wins) / total * 100
+    avg_win = gross_win / len(wins) if wins else None
+    avg_loss = -gross_loss / len(losses) if losses else None
+    ratio = (avg_win / -avg_loss) if (avg_win is not None and avg_loss is not None) else None
+    pf = (gross_win / gross_loss) if gross_loss > 0 else None
+
+    lines = [
+        f"STATS (last {days} days)",
+        f"Closed trades: {total} (wins {len(wins)}, losses {len(losses)}, flat {flat})",
+        f"Win rate: {win_rate:.1f}%",
+        f"Avg win: {_money(avg_win) if avg_win is not None else 'n/a'} | "
+        f"Avg loss: {_money(avg_loss) if avg_loss is not None else 'n/a'}",
+        f"Avg win / avg loss: {f'{ratio:.2f}' if ratio is not None else 'n/a'}",
+        f"Profit factor: {f'{pf:.2f}' if pf is not None else 'n/a'}",
+        f"Net P/L: {_money(gross_win - gross_loss)}",
+        "",
+        "By day (trading day):",
+    ]
+    for day in sorted(per_day, reverse=True):
+        amt, n = per_day[day]
+        lines.append(f"  {day}: {_money(amt)} ({n} trades)")
+    lines.append("")
+    lines.append("By pair:")
+    for pair in sorted(per_pair, key=lambda k: per_pair[k][0], reverse=True):
+        amt, n = per_pair[pair]
+        lines.append(f"  {pair}: {_money(amt)} ({n} trades)")
+    return "\n".join(lines)
+
+
 class OandaBroker:
     def __init__(self, settings: Settings, session: requests.Session | None = None):
         self.settings = settings
@@ -659,6 +735,22 @@ class OandaBroker:
         data = self._request("GET", self._account_path("/summary"))
         unrealized = Decimal(str((data.get("account") or {}).get("unrealizedPL", "0")))
         return realized, unrealized
+
+    def closed_trades(self, max_pages: int = 4) -> list[dict]:
+        """Fetch closed trades, newest first, up to 500 per page."""
+        out: list[dict] = []
+        before: int | None = None
+        for _ in range(max_pages):
+            params: dict[str, Any] = {"state": "CLOSED", "count": 500}
+            if before is not None:
+                params["beforeID"] = before
+            data = self._request("GET", self._account_path("/trades"), params=params)
+            page = [t for t in (data.get("trades") or []) if isinstance(t, dict) and t.get("id") is not None]
+            out.extend(page)
+            if len(page) < 500:
+                break
+            before = min(int(t["id"]) for t in page)
+        return out
 
     def close_winning_trades(self) -> tuple[list[tuple[str, str]], list[str], int]:
         """Close every trade currently in profit. Returns ([(instrument, label)], failed, kept)."""
@@ -1046,13 +1138,13 @@ async def run_scan(skip: set[str] | None = None) -> ScanResult | None:
         app.state.scanning = False
 
 
-async def handle_command(cmd: str) -> None:
+async def handle_command(cmd: str, args: list[str] | None = None) -> None:
     try:
         if cmd in ("/start", "/help"):
             await say(
                 "Tris Bot Active (ATR + OpenRouter)\n\n"
                 "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/target - today's P/L and next profit step\n/takeprofit - close all winners, then rescan\n/ai - test OpenRouter connection\n/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
+                "/target - today's P/L and next profit step\n/takeprofit - close all winners, then rescan\n/stats [days] - win rate, avg win/loss, P/L by day\n/ai - test OpenRouter connection\n/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
@@ -1099,6 +1191,22 @@ async def handle_command(cmd: str) -> None:
             await say("Scanning for new setups (skipping the pairs just closed)...")
             result = await run_scan(skip={name for name, _ in closed})
             await say("A scan is already running." if result is None else result.report)
+        elif cmd == "/stats":
+            args = args or []
+            usage = "Usage: /stats or /stats 30 (days, 1 to 365)"
+            try:
+                days = int(args[0]) if args else 7
+            except ValueError:
+                await say(usage)
+                return
+            if not 1 <= days <= 365:
+                await say(usage)
+                return
+            trades = await asyncio.to_thread(app.state.broker.closed_trades)
+            report = compute_stats(trades, days)
+            if len(trades) >= 2000:
+                report += "\n\nNote: only the 2,000 most recent closed trades were read."
+            await say(report)
         elif cmd == "/ai":
             client = app.state.ai_client
             if client is None:
@@ -1196,7 +1304,7 @@ async def telegram_webhook(request: Request):
 
     # Reply to Telegram immediately; long work (scans) runs in the background so
     # Telegram doesn't time out and retry the webhook.
-    task = asyncio.create_task(handle_command(cmd))
+    task = asyncio.create_task(handle_command(cmd, parse_args(str(msg.get("text") or ""))))
     app.state.tasks.add(task)
     task.add_done_callback(app.state.tasks.discard)
     return {"status": "ok"}
