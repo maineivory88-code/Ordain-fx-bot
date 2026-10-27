@@ -54,6 +54,10 @@ class Settings:
     openrouter_model: str
     trade_units: Decimal
     webhook_secret: str
+    breakeven_trigger_pips: Decimal = Decimal("8")
+    breakeven_lock_pips: Decimal = Decimal("1")
+    trail_pips: Decimal = Decimal("0")
+    protect_interval: int = 60
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,16 @@ class SkipPair(Exception):
 OpinionFn = Callable[[str, dict, dict], dict | None]
 
 
+def env_decimal(name: str, default: str) -> Decimal:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return Decimal(default)
+    try:
+        return Decimal(raw)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+
+
 def load_settings() -> Settings:
     missing = [key for key in REQUIRED_ENV if not os.getenv(key, "").strip()]
     if missing:
@@ -111,6 +125,18 @@ def load_settings() -> Settings:
     if secret and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
         raise RuntimeError("TELEGRAM_WEBHOOK_SECRET must match [A-Za-z0-9_-]{1,256}")
 
+    be_trigger = env_decimal("BREAKEVEN_TRIGGER_PIPS", "8")
+    be_lock = env_decimal("BREAKEVEN_LOCK_PIPS", "1")
+    trail = env_decimal("TRAIL_PIPS", "0")
+    if be_lock < 0 or trail < 0 or be_trigger < 0:
+        raise RuntimeError("BREAKEVEN_*/TRAIL_PIPS values cannot be negative")
+    if be_trigger > 0 and be_lock >= be_trigger:
+        raise RuntimeError("BREAKEVEN_LOCK_PIPS must be smaller than BREAKEVEN_TRIGGER_PIPS")
+    try:
+        interval = int(os.getenv("PROTECT_INTERVAL_SECONDS", "60").strip() or "60")
+    except ValueError as exc:
+        raise RuntimeError("PROTECT_INTERVAL_SECONDS must be an integer") from exc
+
     public_url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
     return Settings(
         telegram_token=os.environ["TELEGRAM_TOKEN"].strip(),
@@ -125,6 +151,10 @@ def load_settings() -> Settings:
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free",
         trade_units=units,
         webhook_secret=secret,
+        breakeven_trigger_pips=be_trigger,
+        breakeven_lock_pips=be_lock,
+        trail_pips=trail,
+        protect_interval=interval,
     )
 
 
@@ -200,7 +230,7 @@ def calculate_atr(candles: list[dict], period: int = 14) -> float:
     return sum(window) / len(window)
 
 
-def evaluate_rules(md: dict) -> dict:
+def evaluate_rules(md: dict, require_trend: bool = True) -> dict:
     closes = md.get("last_closes") or []
     if len(closes) < 4:
         return {"should_trade": False, "reason": "Not enough completed closes."}
@@ -223,6 +253,11 @@ def evaluate_rules(md: dict) -> dict:
 
     bullish = above or momentum_up
     bearish = below or momentum_down
+    if require_trend:
+        # Only trade with the bigger trend: EMA50/EMA200 aligned and price on the right side.
+        ema200 = float(md.get("ema200") or ema50)
+        bullish = bullish and last_close > ema200 and ema50 > ema200
+        bearish = bearish and last_close < ema200 and ema50 < ema200
     # Conflicting signals (e.g. above EMA but momentum falling hard) -> stand aside.
     if bullish and bearish:
         return {"should_trade": False, "reason": "Conflicting trend and momentum signals."}
@@ -243,7 +278,7 @@ def evaluate_rules(md: dict) -> dict:
             "tp_pips": 30.0,
             "reason": f"Bearish expansion (ATR {atr:.5f})",
         }
-    return {"should_trade": False, "reason": "No expansion: inside 0.5 ATR band."}
+    return {"should_trade": False, "reason": "No qualified setup (needs ATR expansion + EMA50/EMA200 trend alignment)."}
 
 
 def price_quantum(precision: int) -> Decimal:
@@ -477,6 +512,74 @@ class OandaBroker:
             return None
         return build_market_snapshot(spec, candles.get("candles") or [], prices[0])
 
+    def protect_trades(self) -> list[str]:
+        """Move stops to break-even (+lock) once a trade is in profit; optional trailing stop."""
+        s = self.settings
+        if s.breakeven_trigger_pips <= 0:
+            return []
+        data = self._request("GET", self._account_path("/openTrades"))
+        trades = [t for t in (data.get("trades") or []) if isinstance(t, dict)]
+        if not trades:
+            return []
+        specs = {sp.name: sp for sp in self.list_instruments()}
+        names = sorted({str(t["instrument"]) for t in trades})
+        pricing = self._request("GET", self._account_path("/pricing"), params={"instruments": ",".join(names)})
+        quotes: dict[str, tuple[Decimal, Decimal]] = {}
+        for pr in pricing.get("prices") or []:
+            try:
+                quotes[str(pr["instrument"])] = (
+                    Decimal(str(pr["bids"][0]["price"])),
+                    Decimal(str(pr["asks"][0]["price"])),
+                )
+            except Exception:
+                continue
+
+        notes: list[str] = []
+        for t in trades:
+            try:
+                name = str(t["instrument"])
+                spec, quote_pair = specs.get(name), quotes.get(name)
+                if not spec or not quote_pair:
+                    continue
+                bid, ask = quote_pair
+                entry = Decimal(str(t["price"]))
+                is_long = Decimal(str(t["currentUnits"])) > 0
+                pip = spec.pip
+                profit_pips = ((bid - entry) if is_long else (entry - ask)) / pip
+                if profit_pips < s.breakeven_trigger_pips:
+                    continue
+
+                quantum = price_quantum(spec.display_precision)
+                lock = s.breakeven_lock_pips * pip
+                raw_sl = entry + lock if is_long else entry - lock
+                target_sl = raw_sl.quantize(quantum, rounding=ROUND_HALF_UP)
+                current_sl = None
+                sl_order = t.get("stopLossOrder")
+                if isinstance(sl_order, dict) and sl_order.get("price"):
+                    current_sl = Decimal(str(sl_order["price"]))
+                improves = current_sl is None or (target_sl > current_sl if is_long else target_sl < current_sl)
+
+                body: dict[str, Any] = {}
+                if improves:
+                    body["stopLoss"] = {"price": format_decimal(target_sl)}
+                if s.trail_pips > 0 and not t.get("trailingStopLossOrder") and profit_pips > s.trail_pips:
+                    dist = (s.trail_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
+                    body["trailingStopLoss"] = {"distance": format_decimal(dist)}
+                if not body:
+                    continue
+
+                trade_id = quote(str(t["id"]), safe="")
+                self._request("PUT", self._account_path(f"/trades/{trade_id}/orders"), json=body)
+                parts = []
+                if "stopLoss" in body:
+                    parts.append(f"SL -> {format_decimal(target_sl)}")
+                if "trailingStopLoss" in body:
+                    parts.append(f"trail {s.trail_pips} pips")
+                notes.append(f"PROTECTED {spec.pair} #{t['id']} (+{profit_pips:.1f} pips): " + ", ".join(parts))
+            except Exception as exc:
+                logger.warning("protect_trades error for %s: %r", t.get("instrument"), exc)
+        return notes
+
     def close_losing_trades(self) -> tuple[list[str], list[str], int]:
         """Close every open trade with negative unrealized P/L. Returns (closed, failed, kept)."""
         data = self._request("GET", self._account_path("/openTrades"))
@@ -601,7 +704,12 @@ async def lifespan(app: FastAPI):
             logger.exception("Failed to set webhook")
     else:
         logger.warning("PUBLIC_URL is not set: Telegram webhook NOT registered, bot will not receive commands")
+    protect_task = None
+    if settings.protect_interval > 0 and settings.breakeven_trigger_pips > 0:
+        protect_task = asyncio.create_task(protect_loop())
     yield
+    if protect_task:
+        protect_task.cancel()
     await bot.shutdown()
     broker.close()
 
@@ -616,6 +724,20 @@ app.state.paused = False
 app.state.scanning = False
 app.state.seen_updates = OrderedDict()
 app.state.tasks = set()
+
+
+async def protect_loop() -> None:
+    """Background loop: lock in profits (break-even / trailing stop) on open trades."""
+    while True:
+        await asyncio.sleep(app.state.settings.protect_interval)
+        try:
+            notes = await asyncio.to_thread(app.state.broker.protect_trades)
+            if notes:
+                await say("\n".join(notes))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Trade protection loop error")
 
 
 async def say(text: str, chat_id: str | None = None) -> None:
@@ -652,7 +774,7 @@ async def handle_command(cmd: str) -> None:
             await say(
                 "Tris Bot Active (ATR + OpenRouter)\n\n"
                 "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
+                "/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
@@ -671,6 +793,9 @@ async def handle_command(cmd: str) -> None:
             else:
                 signal = evaluate_rules(md)
                 await say(f"DEBUG EUR/USD:\nClose: {md['last_closes'][-1]}\nATR: {md['atr']:.5f}\nSignal: {json.dumps(signal)}")
+        elif cmd == "/protect":
+            notes = await asyncio.to_thread(app.state.broker.protect_trades)
+            await say("\n".join(notes) if notes else "No trades needed protection right now.")
         elif cmd in ("/closelosers", "/closelosses"):
             await say("Closing all losing trades...")
             closed, failed, kept = await asyncio.to_thread(app.state.broker.close_losing_trades)
@@ -762,6 +887,12 @@ async def run_agent_check(request: Request, key: str = ""):
     supplied = key or request.headers.get("x-cron-key", "")
     if not hmac.compare_digest(supplied, settings.cron_secret):
         raise HTTPException(status_code=403)
+    try:
+        notes = await asyncio.to_thread(app.state.broker.protect_trades)
+        if notes:
+            await say("\n".join(notes))
+    except Exception:
+        logger.exception("Trade protection failed")
     if app.state.paused:
         return {"status": "paused"}
     result = await run_scan()
