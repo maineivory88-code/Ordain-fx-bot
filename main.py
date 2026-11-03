@@ -579,13 +579,10 @@ def format_dec(value: Decimal) -> str:
 
 
 def price_request_names(specs: dict) -> list[str]:
-    """Instruments needed for prices: every configured pair plus the USD conversion pairs."""
-    names: list[str] = list(specs.keys())
-    for spec in specs.values():
-        q = spec.quote_ccy
-        if q != "USD":
-            names += [f"{q}_USD", f"USD_{q}"]
-    return list(dict.fromkeys(names))
+    """Only instruments OANDA actually lists. The configured pairs already include every
+    USD conversion needed for sizing (USD_JPY, USD_CHF, USD_CAD, GBP_USD), so no extra
+    names are requested. Requesting a non-existent name such as JPY_USD makes OANDA reject the call."""
+    return list(specs.keys())
 
 
 def run_cycle(broker: OandaBroker, settings: Settings, opinion_fn: Callable[[str, dict], dict], blocked: set[str]) -> ScanResult:
