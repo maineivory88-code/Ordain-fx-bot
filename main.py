@@ -1,4 +1,12 @@
-"""Tris forex agent: OANDA execution, ATR rules, OpenRouter notes, Telegram control."""
+"""Tris forex agent: OANDA execution, ATR rules, OpenRouter notes, Telegram control.
+
+Exit rules (applied to every open trade on the account, checked every few seconds):
+  - unrealized P/L >= TAKE_PROFIT_USD ($3.00)          -> close (take profit)
+  - unrealized P/L <= -CUT_LOSS_USD (-$1.50)            -> close (cut loss)
+  - once a trade reaches FLOOR_ARM_USD ($2.00) it is armed; if it later falls below $2.00 -> close
+Entries: ATR/EMA rules on every tradable currency pair and XAU_USD, scanned on a timer.
+Each pair can open at most one new trade per H1 bar. No broker take profit is set.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +18,7 @@ import os
 import re
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Callable
@@ -22,10 +30,7 @@ from fastapi import FastAPI, HTTPException, Request
 from openai import OpenAI
 from telegram import Bot
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("tris")
 
 REQUIRED_ENV = (
@@ -40,6 +45,17 @@ SEEN_UPDATES_LIMIT = 500
 CANDLE_LOOKBACK = 300
 MIN_CLOSES = 50
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+TRADABLE_TYPES = ("CURRENCY", "METAL")
+GOLD = "XAU_USD"
+
+# Exit rules, in USD of unrealized P/L per trade
+TAKE_PROFIT_USD = Decimal("3.00")
+FLOOR_ARM_USD = Decimal("2.00")
+CUT_LOSS_USD = Decimal("1.50")
+
+EXIT_CHECK_SECONDS = 5
+HOUSEKEEPING_SECONDS = 60
+SCAN_INTERVAL_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -56,17 +72,11 @@ class Settings:
     openrouter_model: str
     trade_units: Decimal
     webhook_secret: str
-    breakeven_trigger_pips: Decimal = Decimal("8")
-    breakeven_lock_pips: Decimal = Decimal("1")
-    trail_pips: Decimal = Decimal("0")
-    protect_interval: int = 60
-    cycle_target: Decimal = Decimal("20")
-    daily_loss_limit: Decimal = Decimal("150")
-    trade_instruments: frozenset = frozenset(("EUR_USD", "GBP_USD", "GBP_JPY", "XAU_USD", "USD_JPY"))
-    xau_risk_usd: Decimal = Decimal("20")
-    gold_sl_atr: Decimal = Decimal("1.5")
-    gold_tp_atr: Decimal = Decimal("3")
-    trading_session: str = "all"
+    cycle_target: Decimal
+    daily_loss_limit: Decimal
+    xau_risk_usd: Decimal
+    gold_sl_atr: Decimal
+    trading_session: str
 
 
 @dataclass(frozen=True)
@@ -93,14 +103,18 @@ class ScanResult:
     executed: int = 0
     failed: int = 0
     alert: bool = False
+    entered: list[str] = field(default_factory=list)
+    gold_status: str = ""
 
 
 class SkipPair(Exception):
     pass
 
 
-OpinionFn = Callable[[str, dict, dict], dict | None]
+OpinionFn = Callable[[str, dict, dict], dict]
 
+
+# ---------- time, sessions, market hours ----------
 
 def trading_day_start(now: datetime | None = None) -> datetime:
     """Start of the current forex trading day (17:00 New York), as a UTC datetime."""
@@ -118,11 +132,16 @@ def trading_day_start(now: datetime | None = None) -> datetime:
         return start
 
 
+def bar_key(now: datetime) -> str:
+    """Identifier of the current H1 bar."""
+    return now.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+
+
 SESSION_WINDOWS_UTC = {
-    "all": None,          # 24h, all sessions
-    "asia": (0, 9),       # Tokyo/Sydney, roughly 00:00-09:00 UTC
-    "london": (7, 16),    # roughly 07:00-16:00 UTC
-    "ny": (12, 21),       # roughly 12:00-21:00 UTC
+    "all": None,        # 24h
+    "asia": (0, 9),     # roughly 00:00-09:00 UTC
+    "london": (7, 16),  # roughly 07:00-16:00 UTC
+    "ny": (12, 21),     # roughly 12:00-21:00 UTC
 }
 
 
@@ -130,11 +149,11 @@ def market_open(now: datetime | None = None) -> bool:
     """Forex trades Sunday 17:00 to Friday 17:00 New York time."""
     local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
     wd, hour = local.weekday(), local.hour
-    if wd == 5:  # Saturday
+    if wd == 5:
         return False
-    if wd == 4 and hour >= 17:  # Friday evening
+    if wd == 4 and hour >= 17:
         return False
-    if wd == 6 and hour < 17:  # Sunday before the open
+    if wd == 6 and hour < 17:
         return False
     return True
 
@@ -146,6 +165,8 @@ def session_open(now: datetime | None, session: str) -> bool:
     hour = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).hour
     return window[0] <= hour < window[1]
 
+
+# ---------- configuration ----------
 
 def env_decimal(name: str, default: str) -> Decimal:
     raw = os.getenv(name, "").strip()
@@ -167,11 +188,7 @@ def load_settings() -> Settings:
         raise RuntimeError("OANDA_ENV must be 'practice' or 'live'")
     host = "api-fxpractice.oanda.com" if oanda_env == "practice" else "api-fxtrade.oanda.com"
 
-    units_raw = os.getenv("TRADE_UNITS", "5000").strip()
-    try:
-        units = Decimal(units_raw)
-    except Exception as exc:
-        raise RuntimeError("TRADE_UNITS must be a number") from exc
+    units = env_decimal("TRADE_UNITS", "5000")
     if units <= 0:
         raise RuntimeError("TRADE_UNITS must be greater than 0")
 
@@ -179,41 +196,17 @@ def load_settings() -> Settings:
     if secret and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
         raise RuntimeError("TELEGRAM_WEBHOOK_SECRET must match [A-Za-z0-9_-]{1,256}")
 
-    be_trigger = env_decimal("BREAKEVEN_TRIGGER_PIPS", "8")
-    be_lock = env_decimal("BREAKEVEN_LOCK_PIPS", "1")
-    trail = env_decimal("TRAIL_PIPS", "0")
-    if be_lock < 0 or trail < 0 or be_trigger < 0:
-        raise RuntimeError("BREAKEVEN_*/TRAIL_PIPS values cannot be negative")
-    if be_trigger > 0 and be_lock >= be_trigger:
-        raise RuntimeError("BREAKEVEN_LOCK_PIPS must be smaller than BREAKEVEN_TRIGGER_PIPS")
-    try:
-        interval = int(os.getenv("PROTECT_INTERVAL_SECONDS", "60").strip() or "60")
-    except ValueError as exc:
-        raise RuntimeError("PROTECT_INTERVAL_SECONDS must be an integer") from exc
-
     cycle = env_decimal("CYCLE_PROFIT_TARGET", "20")
-    if cycle < 0:
-        raise RuntimeError("CYCLE_PROFIT_TARGET cannot be negative")
     loss_limit = env_decimal("DAILY_LOSS_LIMIT", "150")
-    if loss_limit < 0:
-        raise RuntimeError("DAILY_LOSS_LIMIT cannot be negative (use 0 to turn it off)")
-    raw_instruments = os.getenv("TRADE_INSTRUMENTS", "").strip()
-    if raw_instruments:
-        instruments = frozenset(x.strip().upper() for x in raw_instruments.split(",") if x.strip())
-    else:
-        instruments = frozenset(("EUR_USD", "GBP_USD", "GBP_JPY", "XAU_USD", "USD_JPY"))
-    if not all(re.fullmatch(r"[A-Z]{3}_[A-Z]{3}", i) for i in instruments):
-        raise RuntimeError("TRADE_INSTRUMENTS must look like EUR_USD,GBP_USD,...")
     xau_risk = env_decimal("XAU_RISK_USD", "20")
     gold_sl = env_decimal("GOLD_SL_ATR", "1.5")
-    gold_tp = env_decimal("GOLD_TP_ATR", "3")
-    if xau_risk <= 0 or gold_sl <= 0 or gold_tp <= 0:
-        raise RuntimeError("XAU_RISK_USD, GOLD_SL_ATR and GOLD_TP_ATR must be greater than 0")
+    if min(cycle, loss_limit) < 0 or xau_risk <= 0 or gold_sl <= 0:
+        raise RuntimeError("Profit/loss/risk settings have invalid values")
+
     session = os.getenv("TRADING_SESSION", "all").strip().lower()
     if session not in SESSION_WINDOWS_UTC:
         raise RuntimeError("TRADING_SESSION must be one of: " + ", ".join(SESSION_WINDOWS_UTC))
 
-    public_url = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
     return Settings(
         telegram_token=os.environ["TELEGRAM_TOKEN"].strip(),
         telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"].strip(),
@@ -221,22 +214,16 @@ def load_settings() -> Settings:
         oanda_account_id=os.environ["OANDA_ACCOUNT_ID"].strip(),
         openrouter_api_key=os.environ["OPENROUTER_API_KEY"].strip(),
         cron_secret=os.getenv("CRON_SECRET", "").strip(),
-        public_url=public_url,
+        public_url=os.getenv("PUBLIC_URL", "").strip().rstrip("/"),
         oanda_base=f"https://{host}/v3",
         oanda_env=oanda_env,
         openrouter_model=os.getenv("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free",
         trade_units=units,
         webhook_secret=secret,
-        breakeven_trigger_pips=be_trigger,
-        breakeven_lock_pips=be_lock,
-        trail_pips=trail,
-        protect_interval=interval,
         cycle_target=cycle,
         daily_loss_limit=loss_limit,
-        trade_instruments=instruments,
         xau_risk_usd=xau_risk,
         gold_sl_atr=gold_sl,
-        gold_tp_atr=gold_tp,
         trading_session=session,
     )
 
@@ -247,12 +234,13 @@ def webhook_url(public_url: str) -> str:
     return f"{public_url}/telegram-webhook"
 
 
+# ---------- telegram helpers ----------
+
 def parse_command(text: str) -> str:
     stripped = text.strip()
     if not stripped:
         return ""
-    token = stripped.split()[0]
-    return token.split("@", 1)[0].lower()
+    return stripped.split()[0].split("@", 1)[0].lower()
 
 
 def parse_args(text: str) -> list[str]:
@@ -279,7 +267,6 @@ def chunk_text(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
 
 
 def remember_update(seen: OrderedDict, update_id: Any) -> bool:
-    """Return True if this update was already processed."""
     if update_id is None:
         return False
     if update_id in seen:
@@ -290,12 +277,12 @@ def remember_update(seen: OrderedDict, update_id: Any) -> bool:
     return False
 
 
+# ---------- indicators and entry rules ----------
+
 def ema(values: list[float], period: int) -> float:
     if not values:
         raise ValueError("EMA requires at least one value")
     period = min(period, len(values))
-    if period <= 0:
-        raise ValueError("EMA period must be positive")
     k = 2 / (period + 1)
     seed = sum(values[:period]) / period
     for value in values[period:]:
@@ -313,25 +300,22 @@ def calculate_atr(candles: list[dict], period: int = 14) -> float:
         prev_close = float(candles[index - 1]["mid"]["c"])
         true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
     window = true_ranges[-period:]
-    if not window:
-        return 0.0
-    return sum(window) / len(window)
+    return sum(window) / len(window) if window else 0.0
 
 
-def evaluate_rules(md: dict, require_trend: bool = True) -> dict:
+def evaluate_rules(md: dict) -> dict:
     closes = md.get("last_closes") or []
     if len(closes) < 4:
-        return {"should_trade": False, "reason": "Not enough completed closes."}
-
+        return {"should_trade": False, "reason": "not enough completed closes"}
     atr = float(md.get("atr") or 0)
     if atr <= 0:
-        return {"should_trade": False, "reason": "ATR is zero; skipping flat or invalid data."}
+        return {"should_trade": False, "reason": "ATR is zero"}
 
     ema50 = float(md["ema50"])
+    ema200 = float(md.get("ema200") or ema50)
     last_close = float(closes[-1])
     prev_close = float(closes[-2])
-    three_bars_ago = float(closes[-4])
-    momentum = last_close - three_bars_ago
+    momentum = last_close - float(closes[-4])
     min_distance = 0.5 * atr
 
     above = last_close > ema50 + min_distance
@@ -339,34 +323,40 @@ def evaluate_rules(md: dict, require_trend: bool = True) -> dict:
     momentum_up = last_close > prev_close and momentum > min_distance
     momentum_down = last_close < prev_close and momentum < -min_distance
 
-    bullish = above or momentum_up
-    bearish = below or momentum_down
-    if require_trend:
-        # Only trade with the bigger trend: EMA50/EMA200 aligned and price on the right side.
-        ema200 = float(md.get("ema200") or ema50)
-        bullish = bullish and last_close > ema200 and ema50 > ema200
-        bearish = bearish and last_close < ema200 and ema50 < ema200
-    # Conflicting signals (e.g. above EMA but momentum falling hard) -> stand aside.
+    # Trade only with the bigger trend: EMA50/EMA200 aligned, price on the same side of EMA200.
+    bullish = (above or momentum_up) and last_close > ema200 and ema50 > ema200
+    bearish = (below or momentum_down) and last_close < ema200 and ema50 < ema200
     if bullish and bearish:
-        return {"should_trade": False, "reason": "Conflicting trend and momentum signals."}
-
+        return {"should_trade": False, "reason": "conflicting signals"}
     if bullish:
-        return {
-            "should_trade": True,
-            "direction": "BUY",
-            "sl_pips": 15.0,
-            "tp_pips": 30.0,
-            "reason": f"Bullish expansion (ATR {atr:.5f})",
-        }
+        return {"should_trade": True, "direction": "BUY", "sl_pips": 15.0, "reason": f"bullish expansion, ATR {atr:.5f}"}
     if bearish:
-        return {
-            "should_trade": True,
-            "direction": "SELL",
-            "sl_pips": 15.0,
-            "tp_pips": 30.0,
-            "reason": f"Bearish expansion (ATR {atr:.5f})",
-        }
-    return {"should_trade": False, "reason": "No qualified setup (needs ATR expansion + EMA50/EMA200 trend alignment)."}
+        return {"should_trade": True, "direction": "SELL", "sl_pips": 15.0, "reason": f"bearish expansion, ATR {atr:.5f}"}
+    return {"should_trade": False, "reason": "no setup (needs ATR expansion and EMA50/EMA200 alignment)"}
+
+
+def build_market_snapshot(candles: list[dict], price: dict) -> dict | None:
+    completed = [c for c in candles if c.get("complete") and isinstance(c.get("mid"), dict)]
+    if len(completed) < MIN_CLOSES:
+        return None
+    try:
+        closes = [float(c["mid"]["c"]) for c in completed]
+        atr = calculate_atr(completed)
+        bid = Decimal(str(price["bids"][0]["price"]))
+        ask = Decimal(str(price["asks"][0]["price"]))
+    except Exception:
+        return None
+    if atr <= 0 or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    return {
+        "bid": format_decimal(bid),
+        "ask": format_decimal(ask),
+        "tradeable": bool(price.get("tradeable", True)),
+        "ema50": ema(closes, 50),
+        "ema200": ema(closes, 200),
+        "last_closes": closes[-10:],
+        "atr": atr,
+    }
 
 
 def price_quantum(precision: int) -> Decimal:
@@ -377,75 +367,36 @@ def format_decimal(value: Decimal) -> str:
     return format(value, "f")
 
 
-def protective_prices(
-    entry: Decimal,
-    direction: str,
-    sl_pips: Decimal,
-    tp_pips: Decimal,
-    pip: Decimal,
-    precision: int,
-) -> tuple[Decimal, Decimal]:
-    quantum = price_quantum(precision)
-    sl_distance = (sl_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
-    tp_distance = (tp_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
-    if sl_distance <= 0 or tp_distance <= 0:
-        raise ValueError("SL/TP distance rounded to zero")
-    if direction == "BUY":
-        stop = (entry - sl_distance).quantize(quantum, rounding=ROUND_HALF_UP)
-        target = (entry + tp_distance).quantize(quantum, rounding=ROUND_HALF_UP)
-        return stop, target
-    if direction == "SELL":
-        stop = (entry + sl_distance).quantize(quantum, rounding=ROUND_HALF_UP)
-        target = (entry - tp_distance).quantize(quantum, rounding=ROUND_HALF_UP)
-        return stop, target
-    raise ValueError(f"Unknown direction: {direction}")
-
-
 def order_units(units: Decimal, direction: str, spec: InstrumentSpec) -> str:
     signed = units if direction == "BUY" else -units
-    quantum = price_quantum(spec.trade_units_precision)
-    sized = signed.quantize(quantum, rounding=ROUND_HALF_UP)
+    sized = signed.quantize(price_quantum(spec.trade_units_precision), rounding=ROUND_HALF_UP)
     if sized == 0 or abs(sized) < spec.minimum_trade_size:
-        raise SkipPair(f"units below minimum for {spec.name}")
+        raise SkipPair(f"size {sized} below minimum {spec.minimum_trade_size}")
     if spec.maximum_order_units > 0 and abs(sized) > spec.maximum_order_units:
-        raise SkipPair(f"units exceed maximum for {spec.name}")
+        raise SkipPair(f"size {sized} above maximum {spec.maximum_order_units}")
     return format_decimal(sized)
 
 
-def build_order(
-    spec: InstrumentSpec,
-    direction: str,
-    units: Decimal,
-    sl_pips: float,
-    tp_pips: float,
-    md: dict,
-    settings: Settings,
-) -> dict:
-    entry_key = "ask" if direction == "BUY" else "bid"
-    entry = Decimal(md[entry_key])
+def build_order(spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, md: dict, settings: Settings) -> dict:
+    """Market order with a hard stop loss and NO take profit (exits are handled by the bot)."""
+    entry = Decimal(md["ask" if direction == "BUY" else "bid"])
     quantum = price_quantum(spec.display_precision)
-    if spec.name == "XAU_USD":
-        # Gold: stops and targets are multiples of ATR (in dollars), and size is set so
-        # a stop-out costs about XAU_RISK_USD.
+    if spec.name == GOLD:
         atr = Decimal(str(md["atr"]))
         sl_dist = (settings.gold_sl_atr * atr).quantize(quantum, rounding=ROUND_HALF_UP)
-        tp_dist = (settings.gold_tp_atr * atr).quantize(quantum, rounding=ROUND_HALF_UP)
-        if sl_dist <= 0 or tp_dist <= 0:
-            raise SkipPair("gold ATR distance rounded to zero")
+        if sl_dist <= 0:
+            raise SkipPair("gold stop distance rounded to zero")
         oz = (settings.xau_risk_usd / sl_dist).quantize(price_quantum(spec.trade_units_precision), rounding=ROUND_DOWN)
-        units_str = order_units(oz, direction, spec)  # raises SkipPair if below minimum
+        # Never size below one ounce. If the ATR stop is wider than the risk budget, the
+        # trade risks more than XAU_RISK_USD, and the scan report says so.
+        minimum = max(spec.minimum_trade_size, Decimal(1).scaleb(-spec.trade_units_precision))
+        units_str = order_units(max(oz, minimum), direction, spec)
     else:
         sl_dist = (Decimal(str(sl_pips)) * spec.pip).quantize(quantum, rounding=ROUND_HALF_UP)
-        tp_dist = (Decimal(str(tp_pips)) * spec.pip).quantize(quantum, rounding=ROUND_HALF_UP)
-        if sl_dist <= 0 or tp_dist <= 0:
-            raise ValueError("SL/TP distance rounded to zero")
+        if sl_dist <= 0:
+            raise SkipPair("stop distance rounded to zero")
         units_str = order_units(units, direction, spec)
-    if direction == "BUY":
-        stop, target = entry - sl_dist, entry + tp_dist
-    else:
-        stop, target = entry + sl_dist, entry - tp_dist
-    stop = stop.quantize(quantum, rounding=ROUND_HALF_UP)
-    target = target.quantize(quantum, rounding=ROUND_HALF_UP)
+    stop = (entry - sl_dist if direction == "BUY" else entry + sl_dist).quantize(quantum, rounding=ROUND_HALF_UP)
     return {
         "order": {
             "units": units_str,
@@ -454,11 +405,9 @@ def build_order(
             "type": "MARKET",
             "positionFill": "DEFAULT",
             "stopLossOnFill": {"price": format_decimal(stop)},
-            "takeProfitOnFill": {"price": format_decimal(target)},
         },
         "_entry": entry,
         "_stop": stop,
-        "_target": target,
     }
 
 
@@ -470,9 +419,10 @@ def interpret_order_response(res: Any) -> tuple[str, str]:
     reject = res.get("orderRejectTransaction") or res.get("orderCancelTransaction") or {}
     if not isinstance(reject, dict):
         reject = {}
-    reason = reject.get("reason") or res.get("errorMessage") or str(res)
-    return "rejected", str(reason)[:500]
+    return "rejected", str(reject.get("reason") or res.get("errorMessage") or res)[:500]
 
+
+# ---------- OpenRouter (advisory only; never blocks a trade) ----------
 
 def extract_json(text: str) -> dict:
     cleaned = text.strip()
@@ -499,48 +449,11 @@ def explicit_disagree(opinion: dict | None) -> bool:
     return value is False
 
 
-def build_market_snapshot(spec: InstrumentSpec, candles: list[dict], price: dict) -> dict | None:
-    completed = [c for c in candles if c.get("complete") and isinstance(c.get("mid"), dict)]
-    if len(completed) < MIN_CLOSES:
-        return None
-    try:
-        closes = [float(c["mid"]["c"]) for c in completed]
-        atr = calculate_atr(completed)
-    except Exception:
-        return None
-    if atr <= 0:
-        return None
-
-    bids = price.get("bids") or []
-    asks = price.get("asks") or []
-    if not bids or not asks:
-        return None
-    try:
-        bid = Decimal(str(bids[0]["price"]))
-        ask = Decimal(str(asks[0]["price"]))
-    except Exception:
-        return None
-    if bid <= 0 or ask <= 0 or ask < bid:
-        return None
-
-    return {
-        "bid": format_decimal(bid),
-        "ask": format_decimal(ask),
-        "tradeable": bool(price.get("tradeable", True)),
-        "ema50": ema(closes, 50),
-        "ema200": ema(closes, 200),
-        "last_closes": closes[-10:],
-        "atr": atr,
-        "display_precision": spec.display_precision,
-    }
-
-
 def _short_error(exc: Exception) -> str:
-    text = str(exc) or exc.__class__.__name__
-    return text[:160]
+    return (str(exc) or exc.__class__.__name__)[:160]
 
 
-def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule_signal: dict) -> dict | None:
+def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule_signal: dict) -> dict:
     prompt = (
         f"Review trade signal for {pair}.\nSignal: {json.dumps(rule_signal)}\nData: {json.dumps(md)}\n"
         'Return JSON only: {"agree": true, "comment": "short text"}'
@@ -550,15 +463,13 @@ def get_openrouter_opinion(client: OpenAI, model: str, pair: str, md: dict, rule
         {"role": "user", "content": prompt},
     ]
     last_error: Exception | None = None
-    # Some OpenRouter models reject JSON mode; if so, retry as plain text and parse the JSON.
-    for json_mode in (True, False):
+    for json_mode in (True, False):  # some models reject JSON mode; retry as plain text
         try:
             kwargs: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": 300}
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             response = client.chat.completions.create(**kwargs)
-            content = response.choices[0].message.content or ""
-            data = extract_json(content)
+            data = extract_json(response.choices[0].message.content or "")
             return {"agree": data.get("agree", True), "comment": str(data.get("comment", "N/A"))[:500]}
         except Exception as exc:
             last_error = exc
@@ -574,6 +485,8 @@ def ai_note(opinion: dict | None) -> str:
     agree = not explicit_disagree(opinion)
     return f"OpenRouter AI: {'Agree' if agree else 'Caution'} - {opinion.get('comment', 'N/A')}"
 
+
+# ---------- statistics ----------
 
 def _money(x: Decimal) -> str:
     return f"{x:+.2f}"
@@ -602,31 +515,25 @@ def compute_stats(trades: list[dict], days: int, now: datetime | None = None) ->
             losses.append(net)
         else:
             flat += 1
-        day = trading_day_start(closed).date().isoformat()
-        row = per_day.setdefault(day, [Decimal(0), 0])
-        row[0] += net
-        row[1] += 1
-        pair = str(t.get("instrument", "?")).replace("_", "/")
-        row = per_pair.setdefault(pair, [Decimal(0), 0])
-        row[0] += net
-        row[1] += 1
+        for bucket, key in ((per_day, trading_day_start(closed).date().isoformat()),
+                            (per_pair, str(t.get("instrument", "?")).replace("_", "/"))):
+            row = bucket.setdefault(key, [Decimal(0), 0])
+            row[0] += net
+            row[1] += 1
 
     total = len(wins) + len(losses) + flat
     if total == 0:
         return f"STATS (last {days} days)\nNo closed trades in this period."
-
     gross_win = sum(wins, Decimal(0))
     gross_loss = -sum(losses, Decimal(0))
-    win_rate = len(wins) / total * 100
     avg_win = gross_win / len(wins) if wins else None
     avg_loss = -gross_loss / len(losses) if losses else None
     ratio = (avg_win / -avg_loss) if (avg_win is not None and avg_loss is not None) else None
     pf = (gross_win / gross_loss) if gross_loss > 0 else None
-
     lines = [
         f"STATS (last {days} days)",
         f"Closed trades: {total} (wins {len(wins)}, losses {len(losses)}, flat {flat})",
-        f"Win rate: {win_rate:.1f}%",
+        f"Win rate: {len(wins) / total * 100:.1f}%",
         f"Avg win: {_money(avg_win) if avg_win is not None else 'n/a'} | "
         f"Avg loss: {_money(avg_loss) if avg_loss is not None else 'n/a'}",
         f"Avg win / avg loss: {f'{ratio:.2f}' if ratio is not None else 'n/a'}",
@@ -638,23 +545,21 @@ def compute_stats(trades: list[dict], days: int, now: datetime | None = None) ->
     for day in sorted(per_day, reverse=True):
         amt, n = per_day[day]
         lines.append(f"  {day}: {_money(amt)} ({n} trades)")
-    lines.append("")
-    lines.append("By pair:")
+    lines += ["", "By pair:"]
     for pair in sorted(per_pair, key=lambda k: per_pair[k][0], reverse=True):
         amt, n = per_pair[pair]
         lines.append(f"  {pair}: {_money(amt)} ({n} trades)")
     return "\n".join(lines)
 
 
+# ---------- OANDA ----------
+
 class OandaBroker:
     def __init__(self, settings: Settings, session: requests.Session | None = None):
         self.settings = settings
         self.session = session or requests.Session()
         self.session.headers.update(
-            {
-                "Authorization": f"Bearer {settings.oanda_api_key}",
-                "Content-Type": "application/json",
-            }
+            {"Authorization": f"Bearer {settings.oanda_api_key}", "Content-Type": "application/json"}
         )
 
     def close(self) -> None:
@@ -669,30 +574,34 @@ class OandaBroker:
         return response.json()
 
     def _account_path(self, suffix: str) -> str:
-        account = quote(self.settings.oanda_account_id, safe="")
-        return f"/accounts/{account}{suffix}"
+        return f"/accounts/{quote(self.settings.oanda_account_id, safe='')}{suffix}"
 
     def list_instruments(self) -> list[InstrumentSpec]:
+        """Every currency pair and metal this account can trade."""
         data = self._request("GET", self._account_path("/instruments"))
         specs = []
         for raw in data.get("instruments") or []:
             name = str(raw.get("name") or "")
-            if raw.get("type") in ("CURRENCY", "METAL") and name in self.settings.trade_instruments:
-                specs.append(
-                    InstrumentSpec(
-                        name=str(raw["name"]),
-                        pip_location=int(raw["pipLocation"]),
-                        display_precision=int(raw["displayPrecision"]),
-                        trade_units_precision=int(raw.get("tradeUnitsPrecision") or 0),
-                        minimum_trade_size=Decimal(str(raw.get("minimumTradeSize") or "1")),
-                        maximum_order_units=Decimal(str(raw.get("maximumOrderUnits") or "0")),
-                    )
+            if raw.get("type") not in TRADABLE_TYPES or not re.fullmatch(r"[A-Z]{3}_[A-Z]{3}", name):
+                continue
+            specs.append(
+                InstrumentSpec(
+                    name=name,
+                    pip_location=int(raw["pipLocation"]),
+                    display_precision=int(raw["displayPrecision"]),
+                    trade_units_precision=int(raw.get("tradeUnitsPrecision") or 0),
+                    minimum_trade_size=Decimal(str(raw.get("minimumTradeSize") or "1")),
+                    maximum_order_units=Decimal(str(raw.get("maximumOrderUnits") or "0")),
                 )
+            )
         return specs
 
-    def open_instruments(self) -> set[str]:
+    def open_trades(self) -> list[dict]:
         data = self._request("GET", self._account_path("/openTrades"))
-        return {str(t["instrument"]) for t in (data.get("trades") or []) if isinstance(t, dict)}
+        return [t for t in (data.get("trades") or []) if isinstance(t, dict) and t.get("id") is not None]
+
+    def open_instruments(self) -> set[str]:
+        return {str(t.get("instrument")) for t in self.open_trades()}
 
     def market_data(self, spec: InstrumentSpec) -> dict | None:
         candles = self._request(
@@ -704,10 +613,9 @@ class OandaBroker:
         prices = pricing.get("prices") or []
         if not prices:
             return None
-        return build_market_snapshot(spec, candles.get("candles") or [], prices[0])
+        return build_market_snapshot(candles.get("candles") or [], prices[0])
 
     def realized_pl_since(self, since: datetime) -> Decimal:
-        """Sum realized P/L (incl. financing and commission) from fills since `since`."""
         fmt = "%Y-%m-%dT%H:%M:%S.000000000Z"
         params = {
             "from": since.strftime(fmt),
@@ -730,14 +638,12 @@ class OandaBroker:
         return total
 
     def daily_pnl(self) -> tuple[Decimal, Decimal]:
-        """Return (realized today, unrealized now) in account currency."""
         realized = self.realized_pl_since(trading_day_start())
         data = self._request("GET", self._account_path("/summary"))
         unrealized = Decimal(str((data.get("account") or {}).get("unrealizedPL", "0")))
         return realized, unrealized
 
     def closed_trades(self, max_pages: int = 4) -> list[dict]:
-        """Fetch closed trades, newest first, up to 500 per page."""
         out: list[dict] = []
         before: int | None = None
         for _ in range(max_pages):
@@ -752,229 +658,184 @@ class OandaBroker:
             before = min(int(t["id"]) for t in page)
         return out
 
-    def close_winning_trades(self) -> tuple[list[tuple[str, str]], list[str], int]:
-        """Close every trade currently in profit. Returns ([(instrument, label)], failed, kept)."""
-        data = self._request("GET", self._account_path("/openTrades"))
-        closed: list[tuple[str, str]] = []
+    def close_trade(self, trade_id: str) -> None:
+        self._request(
+            "PUT",
+            self._account_path(f"/trades/{quote(str(trade_id), safe='')}/close"),
+            json={"units": "ALL"},
+        )
+
+    def manage_exits(self, armed: set[str]) -> tuple[list[str], list[str]]:
+        """Apply the take-profit, cut-loss and $2 floor rules to every open trade.
+        `armed` (trade ids that have reached FLOOR_ARM_USD) is updated in place."""
+        closed: list[str] = []
         failed: list[str] = []
-        kept = 0
-        for trade in data.get("trades") or []:
-            if not isinstance(trade, dict):
-                continue
+        trades = self.open_trades()
+        armed.intersection_update({str(t["id"]) for t in trades})
+        for trade in trades:
+            tid = str(trade["id"])
+            instrument = str(trade.get("instrument", "?"))
+            label = f"{instrument.replace('_', '/')} #{tid}"
             try:
                 pl = Decimal(str(trade.get("unrealizedPL", "0")))
             except Exception:
                 continue
-            trade_id = str(trade.get("id"))
+
+            reason = None
+            if pl >= TAKE_PROFIT_USD:
+                reason = f"take profit at ${TAKE_PROFIT_USD}"
+            elif pl <= -CUT_LOSS_USD:
+                reason = f"cut loss at -${CUT_LOSS_USD}"
+            elif pl >= FLOOR_ARM_USD:
+                armed.add(tid)
+            elif tid in armed:
+                reason = f"profit fell below ${FLOOR_ARM_USD}"
+
+            if reason is None:
+                continue
+            try:
+                self.close_trade(tid)
+                armed.discard(tid)
+                closed.append(f"{label} ({format_decimal(pl)}): {reason}")
+            except Exception as exc:
+                failed.append(f"{label}: {exc}")
+        return closed, failed
+
+    def close_winning_trades(self, min_profit: Decimal | None = None) -> tuple[list[tuple[str, str]], list[str], int]:
+        closed: list[tuple[str, str]] = []
+        failed: list[str] = []
+        kept = 0
+        for trade in self.open_trades():
+            try:
+                pl = Decimal(str(trade.get("unrealizedPL", "0")))
+            except Exception:
+                continue
             instrument = str(trade.get("instrument", "?"))
-            label = f"{instrument.replace('_', '/')} #{trade_id}"
-            if pl <= 0:
+            label = f"{instrument.replace('_', '/')} #{trade.get('id')}"
+            if pl <= 0 or (min_profit is not None and pl < min_profit):
                 kept += 1
                 continue
             try:
-                self._request(
-                    "PUT",
-                    self._account_path(f"/trades/{quote(trade_id, safe='')}/close"),
-                    json={"units": "ALL"},
-                )
+                self.close_trade(str(trade["id"]))
                 closed.append((instrument, f"{label} (+{format_decimal(pl)})"))
             except Exception as exc:
                 failed.append(f"{label}: {exc}")
         return closed, failed, kept
 
-    def close_all_trades(self) -> tuple[list[str], list[str]]:
-        data = self._request("GET", self._account_path("/openTrades"))
-        closed: list[str] = []
-        failed: list[str] = []
-        for trade in data.get("trades") or []:
-            if not isinstance(trade, dict):
-                continue
-            trade_id = str(trade.get("id"))
-            label = f"{str(trade.get('instrument', '?')).replace('_', '/')} #{trade_id}"
-            try:
-                self._request(
-                    "PUT",
-                    self._account_path(f"/trades/{quote(trade_id, safe='')}/close"),
-                    json={"units": "ALL"},
-                )
-                closed.append(label)
-            except Exception as exc:
-                failed.append(f"{label}: {exc}")
-        return closed, failed
-
-    def protect_trades(self) -> list[str]:
-        """Move stops to break-even (+lock) once a trade is in profit; optional trailing stop."""
-        s = self.settings
-        if s.breakeven_trigger_pips <= 0:
-            return []
-        data = self._request("GET", self._account_path("/openTrades"))
-        trades = [t for t in (data.get("trades") or []) if isinstance(t, dict)]
-        if not trades:
-            return []
-        specs = {sp.name: sp for sp in self.list_instruments()}
-        names = sorted({str(t["instrument"]) for t in trades})
-        pricing = self._request("GET", self._account_path("/pricing"), params={"instruments": ",".join(names)})
-        quotes: dict[str, tuple[Decimal, Decimal]] = {}
-        for pr in pricing.get("prices") or []:
-            try:
-                quotes[str(pr["instrument"])] = (
-                    Decimal(str(pr["bids"][0]["price"])),
-                    Decimal(str(pr["asks"][0]["price"])),
-                )
-            except Exception:
-                continue
-
-        notes: list[str] = []
-        for t in trades:
-            try:
-                name = str(t["instrument"])
-                spec, quote_pair = specs.get(name), quotes.get(name)
-                if not spec or not quote_pair:
-                    continue
-                bid, ask = quote_pair
-                entry = Decimal(str(t["price"]))
-                is_long = Decimal(str(t["currentUnits"])) > 0
-                pip = spec.pip
-                move = (bid - entry) if is_long else (entry - ask)
-                profit_pips = move / pip
-                is_gold = name == "XAU_USD"
-                quantum = price_quantum(spec.display_precision)
-                if is_gold:
-                    # Gold: break-even once profit reaches 1R (the stop distance), locking one tick.
-                    sl_raw = t.get("stopLossOrder")
-                    if not isinstance(sl_raw, dict) or not sl_raw.get("price"):
-                        continue
-                    risk = abs(entry - Decimal(str(sl_raw["price"])))
-                    if risk <= 0 or move < risk:
-                        continue
-                    lock = pip
-                else:
-                    if profit_pips < s.breakeven_trigger_pips:
-                        continue
-                    lock = s.breakeven_lock_pips * pip
-                raw_sl = entry + lock if is_long else entry - lock
-                target_sl = raw_sl.quantize(quantum, rounding=ROUND_HALF_UP)
-                current_sl = None
-                sl_order = t.get("stopLossOrder")
-                if isinstance(sl_order, dict) and sl_order.get("price"):
-                    current_sl = Decimal(str(sl_order["price"]))
-                improves = current_sl is None or (target_sl > current_sl if is_long else target_sl < current_sl)
-
-                body: dict[str, Any] = {}
-                if improves:
-                    body["stopLoss"] = {"price": format_decimal(target_sl)}
-                if s.trail_pips > 0 and not is_gold and not t.get("trailingStopLossOrder") and profit_pips > s.trail_pips:
-                    dist = (s.trail_pips * pip).quantize(quantum, rounding=ROUND_HALF_UP)
-                    body["trailingStopLoss"] = {"distance": format_decimal(dist)}
-                if not body:
-                    continue
-
-                trade_id = quote(str(t["id"]), safe="")
-                self._request("PUT", self._account_path(f"/trades/{trade_id}/orders"), json=body)
-                parts = []
-                if "stopLoss" in body:
-                    parts.append(f"SL -> {format_decimal(target_sl)}")
-                if "trailingStopLoss" in body:
-                    parts.append(f"trail {s.trail_pips} pips")
-                notes.append(f"PROTECTED {spec.pair} #{t['id']} (+{profit_pips:.1f} pips): " + ", ".join(parts))
-            except Exception as exc:
-                logger.warning("protect_trades error for %s: %r", t.get("instrument"), exc)
-        return notes
-
     def close_losing_trades(self) -> tuple[list[str], list[str], int]:
-        """Close every open trade with negative unrealized P/L. Returns (closed, failed, kept)."""
-        data = self._request("GET", self._account_path("/openTrades"))
         closed: list[str] = []
         failed: list[str] = []
         kept = 0
-        for trade in data.get("trades") or []:
-            if not isinstance(trade, dict):
-                continue
+        for trade in self.open_trades():
             try:
                 pl = Decimal(str(trade.get("unrealizedPL", "0")))
             except Exception:
                 continue
-            trade_id = str(trade.get("id"))
-            label = f"{str(trade.get('instrument', '?')).replace('_', '/')} #{trade_id}"
+            label = f"{str(trade.get('instrument', '?')).replace('_', '/')} #{trade.get('id')}"
             if pl >= 0:
                 kept += 1
                 continue
             try:
-                self._request(
-                    "PUT",
-                    self._account_path(f"/trades/{quote(trade_id, safe='')}/close"),
-                    json={"units": "ALL"},
-                )
+                self.close_trade(str(trade["id"]))
                 closed.append(f"{label} ({format_decimal(pl)})")
             except Exception as exc:
                 failed.append(f"{label}: {exc}")
         return closed, failed, kept
 
     def account_summary(self) -> tuple[Any, Any, Any]:
-        data = self._request("GET", self._account_path("/summary"))
-        acc = data.get("account") or {}
+        acc = self._request("GET", self._account_path("/summary")).get("account") or {}
         return acc.get("balance", "N/A"), acc.get("unrealizedPL", "N/A"), acc.get("openTradeCount", 0)
 
-    def submit(self, spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, tp_pips: float, md: dict):
-        built = build_order(spec, direction, units, sl_pips, tp_pips, md, self.settings)
-        entry, stop, target = built.pop("_entry"), built.pop("_stop"), built.pop("_target")
+    def submit(self, spec: InstrumentSpec, direction: str, units: Decimal, sl_pips: float, md: dict):
+        built = build_order(spec, direction, units, sl_pips, md, self.settings)
+        entry, stop = built.pop("_entry"), built.pop("_stop")
         response = self._request("POST", self._account_path("/orders"), json=built)
         status, reason = interpret_order_response(response)
-        return status, entry, stop, target, reason
+        return status, entry, stop, reason
 
 
-def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn, skip_instruments: set[str] | None = None) -> ScanResult:
+def run_cycle(broker: Any, units: Decimal, opinion_fn: OpinionFn, blocked: set[str] | None = None) -> ScanResult:
     try:
         instruments = broker.list_instruments()
-        open_instruments = broker.open_instruments()
+        open_now = broker.open_instruments()
     except Exception as exc:
         return ScanResult(report=f"Scan failed: {exc}", failed=1, alert=True)
 
     reports: list[str] = []
-    executed, failed = 0, 0
+    entered: list[str] = []
+    executed = failed = 0
+    gold_status = "XAU_USD not offered on this account" if all(i.name != GOLD for i in instruments) else ""
+
     for spec in instruments:
-        if spec.name in open_instruments or (skip_instruments and spec.name in skip_instruments):
+        is_gold = spec.name == GOLD
+        if spec.name in open_now:
+            if is_gold:
+                gold_status = "XAU_USD: already has an open trade"
+            continue
+        if blocked and spec.name in blocked:
+            if is_gold:
+                gold_status = "XAU_USD: already entered this hour"
             continue
         try:
             md = broker.market_data(spec)
-            if not md or not md.get("tradeable"):
+            if not md:
+                if is_gold:
+                    gold_status = "XAU_USD: no price data returned"
+                continue
+            if not md.get("tradeable"):
+                if is_gold:
+                    gold_status = "XAU_USD: not tradeable right now (market closed or halted)"
                 continue
             signal = evaluate_rules(md)
             if not signal.get("should_trade"):
+                if is_gold:
+                    gold_status = f"XAU_USD: {signal['reason']}"
                 continue
             opinion = opinion_fn(spec.pair, md, signal)
-            status, entry, stop, target, reason = broker.submit(
-                spec, signal["direction"], units, float(signal["sl_pips"]), float(signal["tp_pips"]), md
-            )
+            status, entry, stop, reason = broker.submit(spec, signal["direction"], units, float(signal["sl_pips"]), md)
             if status == "filled":
                 executed += 1
+                entered.append(spec.name)
                 reports.append(
                     f"TRADE EXECUTED ({spec.pair})\n"
                     f"Direction: {signal['direction']} @ {format_decimal(entry)}\n"
-                    f"SL: {format_decimal(stop)} | TP: {format_decimal(target)}\n"
+                    f"SL: {format_decimal(stop)} | exits: +${TAKE_PROFIT_USD} take profit, "
+                    f"-${CUT_LOSS_USD} cut loss, ${FLOOR_ARM_USD} floor\n"
                     f"{ai_note(opinion)}"
                 )
+                if is_gold:
+                    gold_status = f"XAU_USD: opened {signal['direction']}"
             else:
                 failed += 1
                 reports.append(f"ORDER FAILED ({spec.pair}): {reason}")
+                if is_gold:
+                    gold_status = f"XAU_USD: order rejected: {reason}"
         except SkipPair as exc:
+            if is_gold:
+                gold_status = f"XAU_USD: skipped, {exc}"
             logger.info("Skipped %s: %s", spec.name, exc)
-        except Exception:
+        except Exception as exc:
             logger.exception("Pair scan error for %s", spec.name)
             failed += 1
+            if is_gold:
+                gold_status = f"XAU_USD: error {_short_error(exc)}"
 
     if not reports:
         note = "Scan complete. No eligible setups found."
         if failed:
             note += f" ({failed} pair(s) errored; check logs.)"
-        return ScanResult(report=note, executed=0, failed=failed, alert=False)
+        return ScanResult(report=note, failed=failed, alert=False, gold_status=gold_status)
     return ScanResult(
         report=f"--- SCAN COMPLETED ({executed} opened) ---\n\n" + "\n\n".join(reports),
         executed=executed,
         failed=failed,
         alert=True,
+        entered=entered,
+        gold_status=gold_status,
     )
 
+
+# ---------- app ----------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1005,51 +866,36 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to set webhook")
     else:
-        logger.warning("PUBLIC_URL is not set: Telegram webhook NOT registered, bot will not receive commands")
-    protect_task = None
-    if settings.protect_interval > 0 and (settings.breakeven_trigger_pips > 0 or settings.cycle_target > 0):
-        protect_task = asyncio.create_task(protect_loop())
+        logger.warning("PUBLIC_URL is not set: Telegram webhook NOT registered")
+
+    tasks = [
+        asyncio.create_task(exit_loop()),
+        asyncio.create_task(housekeeping_loop()),
+        asyncio.create_task(scan_loop()),
+    ]
     yield
-    if protect_task:
-        protect_task.cancel()
+    for task in tasks:
+        task.cancel()
     await bot.shutdown()
     broker.close()
 
 
 app = FastAPI(lifespan=lifespan)
-# Defaults so handlers never hit AttributeError if config failed to load.
 app.state.settings = None
 app.state.bot = None
 app.state.broker = None
+app.state.ai_client = None
 app.state.opinion_fn = None
 app.state.paused = False
 app.state.scanning = False
 app.state.seen_updates = OrderedDict()
-app.state.milestone_day = None
-app.state.ai_client = None
-app.state.milestone = 0
-app.state.loss_alert_day = None  # trading day on which the loss alert was sent
 app.state.tasks = set()
-
-
-async def protect_loop() -> None:
-    """Background loop: lock in profits (break-even / trailing stop) on open trades."""
-    while True:
-        await asyncio.sleep(app.state.settings.protect_interval)
-        try:
-            loss_msg = await check_loss_limit()
-            if loss_msg:
-                await say(loss_msg)
-            step_msg = await bank_milestones()
-            if step_msg:
-                await say(step_msg)
-            notes = await asyncio.to_thread(app.state.broker.protect_trades)
-            if notes:
-                await say("\n".join(notes))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Trade protection loop error")
+app.state.armed = set()                 # trade ids that have reached FLOOR_ARM_USD
+app.state.entered_bar = {}              # pair -> H1 bar of its last entry
+app.state.milestone_day = None
+app.state.milestone = 0
+app.state.loss_alert_day = None
+app.state.last_gold_status = "no scan yet"
 
 
 async def say(text: str, chat_id: str | None = None) -> None:
@@ -1067,9 +913,62 @@ async def say(text: str, chat_id: str | None = None) -> None:
         await asyncio.sleep(0.3)
 
 
+async def exit_loop() -> None:
+    """Fast loop: take profit at $3, cut losses at -$1.50, and close armed trades that fall below $2."""
+    while True:
+        await asyncio.sleep(EXIT_CHECK_SECONDS)
+        if not app.state.settings:
+            continue
+        try:
+            closed, failed = await asyncio.to_thread(app.state.broker.manage_exits, app.state.armed)
+            if closed or failed:
+                lines = [f"EXIT: closed {len(closed)} trade(s)."] + closed
+                if failed:
+                    lines += ["FAILED:"] + failed
+                await say("\n".join(lines))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Exit loop error")
+
+
+async def housekeeping_loop() -> None:
+    """Slow loop: daily loss alert and profit-step banking."""
+    while True:
+        await asyncio.sleep(HOUSEKEEPING_SECONDS)
+        if not app.state.settings:
+            continue
+        try:
+            loss_msg = await check_loss_limit()
+            if loss_msg:
+                await say(loss_msg)
+            step_msg = await bank_milestones()
+            if step_msg:
+                await say(step_msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Housekeeping loop error")
+
+
+async def scan_loop() -> None:
+    """Automatic entries on a timer, unless paused."""
+    while True:
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        if not app.state.settings or app.state.paused:
+            continue
+        try:
+            result = await run_scan()
+            if result and result.alert:
+                await say(result.report)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scan loop error")
+
+
 async def check_loss_limit() -> str | None:
-    """Alert once per trading day when total P/L (realized + open) reaches -daily_loss_limit.
-    Does not close trades or stop trading; use /closelosers to close losing trades."""
+    """Alert once per trading day when total P/L reaches -daily_loss_limit. Never closes trades."""
     settings = app.state.settings
     if not settings or settings.daily_loss_limit <= 0:
         return None
@@ -1088,76 +987,103 @@ async def check_loss_limit() -> str | None:
 
 
 async def bank_milestones() -> str | None:
-    """Each time today's realized profit crosses another cycle_target step, take profit on
-    all winning trades. Trading keeps going; the next step is the next cycle_target."""
+    """Each time today's realized profit crosses another cycle_target step, close winners of at
+    least $2.00 (never below the floor). Trading continues."""
     settings = app.state.settings
     if not settings or settings.cycle_target <= 0:
         return None
     today = trading_day_start().isoformat()
     realized, _ = await asyncio.to_thread(app.state.broker.daily_pnl)
     milestone = int(realized // settings.cycle_target)
-    if app.state.milestone_day != today:  # new trading day, or first check after a restart
+    if app.state.milestone_day != today:
         app.state.milestone_day = today
         app.state.milestone = milestone
         return None
     if milestone <= app.state.milestone:
         return None
-    closed, failed, kept = await asyncio.to_thread(app.state.broker.close_winning_trades)
-    if failed:  # do not advance; retry on the next check
+    closed, failed, kept = await asyncio.to_thread(app.state.broker.close_winning_trades, FLOOR_ARM_USD)
+    if failed:
         return "PROFIT STEP reached but some closes failed:\n" + "\n".join(failed)
     app.state.milestone = milestone
     return (
         f"PROFIT STEP: realized today {realized:.2f} (step ${settings.cycle_target}). "
-        f"Took profit on {len(closed)} winning trade(s); {kept} not in profit left open. Trading continues."
+        f"Closed {len(closed)} winner(s) of at least ${FLOOR_ARM_USD}; {kept} left open."
     )
 
 
 async def run_scan(skip: set[str] | None = None) -> ScanResult | None:
-    """Run one scan in a worker thread. Returns None if a scan is already running."""
+    """One scan in a worker thread. Returns None if a scan is already running.
+    Each pair can be entered at most once per H1 bar."""
     try:
         loss_msg = await check_loss_limit()
         if loss_msg:
             await say(loss_msg)
     except Exception:
         logger.exception("Loss limit check failed")
+
     now = datetime.now(timezone.utc)
     if not market_open(now):
         return ScanResult(report="Forex market is closed (weekend). No new entries.")
-    if not session_open(now, app.state.settings.trading_session):
-        return ScanResult(
-            report=f"Outside the '{app.state.settings.trading_session}' session window. No new entries this time."
-        )
+    settings = app.state.settings
+    if not session_open(now, settings.trading_session):
+        return ScanResult(report=f"Outside the '{settings.trading_session}' session window. No new entries.")
     if app.state.scanning:
         return None
+
+    bar = bar_key(now)
+    blocked = {name for name, key in app.state.entered_bar.items() if key == bar}
+    if skip:
+        blocked |= skip
     app.state.scanning = True
     try:
-        return await asyncio.to_thread(
-            run_cycle, app.state.broker, app.state.settings.trade_units, app.state.opinion_fn, skip
-        )
+        result = await asyncio.to_thread(run_cycle, app.state.broker, settings.trade_units, app.state.opinion_fn, blocked)
     finally:
         app.state.scanning = False
+    for name in result.entered:
+        app.state.entered_bar[name] = bar
+    app.state.last_gold_status = result.gold_status or "no gold status"
+    if result.gold_status and not result.alert:
+        result.report += f"\n{result.gold_status}"
+    return result
 
 
 async def handle_command(cmd: str, args: list[str] | None = None) -> None:
+    args = args or []
     try:
         if cmd in ("/start", "/help"):
             await say(
                 "Tris Bot Active (ATR + OpenRouter)\n\n"
-                "/status - state\n/debug - dry run EUR/USD\n/trade - scan & execute\n"
-                "/target - today's P/L and next profit step\n/takeprofit - close all winners, then rescan\n/stats [days] - win rate, avg win/loss, P/L by day\n/ai - test OpenRouter connection\n/protect - lock in profits now\n/closelosers - close all losing trades\n/pause - pause\n/resume - resume"
+                "/status - balance and open trades\n"
+                "/trade - scan all pairs now\n"
+                "/target - today's P/L and profit step\n"
+                "/takeprofit - close all winners now, then rescan\n"
+                "/closelosers - close all losing trades now\n"
+                "/instruments [filter] - list tradable instruments, e.g. /instruments XAU\n"
+                "/stats [days] - win rate, avg win/loss, P/L by day\n"
+                "/debug - dry run EUR/USD\n"
+                "/ai - test OpenRouter connection\n"
+                "/pause - stop automatic and manual entries\n"
+                "/resume - resume entries\n\n"
+                f"Exits are automatic: take profit at ${TAKE_PROFIT_USD}, cut loss at -${CUT_LOSS_USD}, "
+                f"and close if a trade that reached ${FLOOR_ARM_USD} falls back below it."
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
             state = "PAUSED" if app.state.paused else "RUNNING"
-            await say(f"STATUS ({state}, {app.state.settings.oanda_env})\nBalance: {bal}\nPnL: {pnl}\nOpen Trades: {count}")
+            await say(f"STATUS ({state}, {app.state.settings.oanda_env})\nBalance: {bal}\nPnL: {pnl}\n"
+                      f"Open Trades: {count}\nLast gold check: {app.state.last_gold_status}")
+        elif cmd == "/instruments":
+            instruments = await asyncio.to_thread(app.state.broker.list_instruments)
+            names = sorted(i.name for i in instruments)
+            needle = args[0].upper().replace("/", "_") if args else ""
+            matches = [n for n in names if needle in n]
+            body = "\n".join(matches[:80]) if matches else f"No instrument matches '{needle}'."
+            await say(f"{len(names)} tradable instruments on this account.\n{body}")
         elif cmd == "/debug":
             await say("Running debug test on EUR/USD...")
             instruments = await asyncio.to_thread(app.state.broker.list_instruments)
-            spec = next(
-                (i for i in instruments if i.name == "EUR_USD"),
-                InstrumentSpec("EUR_USD", -4, 5, 0, Decimal("1"), Decimal("0")),
-            )
-            md = await asyncio.to_thread(app.state.broker.market_data, spec)
+            spec = next((i for i in instruments if i.name == "EUR_USD"), None)
+            md = await asyncio.to_thread(app.state.broker.market_data, spec) if spec else None
             if not md:
                 await say("Debug Error: Could not fetch EUR_USD data.")
             else:
@@ -1166,13 +1092,14 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
         elif cmd == "/target":
             realized, unrealized = await asyncio.to_thread(app.state.broker.daily_pnl)
             st_ = app.state.settings
+            if st_.cycle_target > 0:
+                next_step = f"${(int(realized // st_.cycle_target) + 1) * st_.cycle_target}"
+            else:
+                next_step = "off"
             await say(
                 f"TODAY'S P/L\nRealized: {realized:.2f}\nUnrealized: {unrealized:.2f}\n"
-                f"Total: {realized + unrealized:.2f}\n"
-                f"Profit step: every ${st_.cycle_target} realized (next at ${(int(realized // st_.cycle_target) + 1) * st_.cycle_target})\n"
-                f"Session: {st_.trading_session}\n"
-                f"Loss alert level: -{st_.daily_loss_limit} "
-                + ("(alert sent today, trading continues)" if app.state.loss_alert_day == trading_day_start().isoformat() else "(not reached)")
+                f"Total: {realized + unrealized:.2f}\nNext profit step (realized): {next_step}\n"
+                f"Session: {st_.trading_session}\nLoss alert level: -{st_.daily_loss_limit}"
             )
         elif cmd in ("/takeprofit", "/takeprofits"):
             await say("Taking profit on all winning trades...")
@@ -1188,11 +1115,10 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
             if app.state.paused:
                 await say("Trading is paused (/pause). Send /resume so the bot can open new trades.")
                 return
-            await say("Scanning for new setups (skipping the pairs just closed)...")
+            await say("Scanning for new setups...")
             result = await run_scan(skip={name for name, _ in closed})
             await say("A scan is already running." if result is None else result.report)
         elif cmd == "/stats":
-            args = args or []
             usage = "Usage: /stats or /stats 30 (days, 1 to 365)"
             try:
                 days = int(args[0]) if args else 7
@@ -1225,9 +1151,6 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
                 except Exception as exc:
                     await say(f"OpenRouter OFFLINE\nModel: {model}\nError: {_short_error(exc)}\n"
                               "If it says 401, the key is wrong. If 404 or model not found, set OPENROUTER_MODEL in Render.")
-        elif cmd == "/protect":
-            notes = await asyncio.to_thread(app.state.broker.protect_trades)
-            await say("\n".join(notes) if notes else "No trades needed protection right now.")
         elif cmd in ("/closelosers", "/closelosses"):
             await say("Closing all losing trades...")
             closed, failed, kept = await asyncio.to_thread(app.state.broker.close_losing_trades)
@@ -1239,7 +1162,7 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
             await say("\n".join(lines))
         elif cmd == "/pause":
             app.state.paused = True
-            await say("Trading paused.")
+            await say("Trading paused. Automatic and manual entries are off. Exits stay active.")
         elif cmd == "/resume":
             app.state.paused = False
             await say("Trading resumed.")
@@ -1288,23 +1211,17 @@ async def telegram_webhook(request: Request):
         return {"status": "ignored"}
 
     sender_chat_id = str((msg.get("chat") or {}).get("id"))
-    cmd = parse_command(str(msg.get("text") or ""))
+    text = str(msg.get("text") or "")
+    cmd = parse_command(text)
 
     if sender_chat_id != settings.telegram_chat_id:
-        logger.warning(
-            "UNAUTHORIZED chat rejected: incoming chat id [%s] != TELEGRAM_CHAT_ID [%s]",
-            sender_chat_id,
-            settings.telegram_chat_id,
-        )
-        if cmd == "/id":  # lets you discover the right chat id to put in TELEGRAM_CHAT_ID
+        logger.warning("UNAUTHORIZED chat rejected: %s", sender_chat_id)
+        if cmd == "/id":
             await say(f"This chat's ID is: {sender_chat_id}", chat_id=sender_chat_id)
         return {"status": "unauthorized"}
 
     logger.info("Command received: %s", cmd)
-
-    # Reply to Telegram immediately; long work (scans) runs in the background so
-    # Telegram doesn't time out and retry the webhook.
-    task = asyncio.create_task(handle_command(cmd, parse_args(str(msg.get("text") or ""))))
+    task = asyncio.create_task(handle_command(cmd, parse_args(text)))
     app.state.tasks.add(task)
     task.add_done_callback(app.state.tasks.discard)
     return {"status": "ok"}
@@ -1319,12 +1236,6 @@ async def run_agent_check(request: Request, key: str = ""):
     supplied = key or request.headers.get("x-cron-key", "")
     if not hmac.compare_digest(supplied, settings.cron_secret):
         raise HTTPException(status_code=403)
-    try:
-        notes = await asyncio.to_thread(app.state.broker.protect_trades)
-        if notes:
-            await say("\n".join(notes))
-    except Exception:
-        logger.exception("Trade protection failed")
     if app.state.paused:
         return {"status": "paused"}
     result = await run_scan()
