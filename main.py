@@ -677,8 +677,10 @@ def check_pair_text(broker: OandaBroker, name: str) -> str:
 
 
 # ---------- GBPJPY MULTI-BOT FOUNDATION ----------
-# Practice-only configuration. All bots remain disabled by default.
-# This section does not submit orders or modify the legacy EMA strategy.
+# Practice only. These three bots do not submit orders.
+# Each bot has its own Telegram token, so each one needs its own webhook
+# (or its own polling loop). They previously never connected, which is why
+# messages to them got no reply.
 
 @dataclass(frozen=True)
 class GJBotConfig:
@@ -686,16 +688,30 @@ class GJBotConfig:
     display_name: str
     enabled: bool
     telegram_token: str
+    telegram_chat_id: str
     oanda_account_id: str
     risk_fraction: Decimal
     weekly_trade_limit: int
+    config_error: str = ""
     oanda_base: str = "https://api-fxpractice.oanda.com/v3"
+
+
+@dataclass
+class GJRuntime:
+    config: GJBotConfig
+    bot: Bot | None = None
+    seen: OrderedDict = field(default_factory=OrderedDict)
+    mode: str = "offline"
+    username: str = ""
+    last_error: str = ""
+    poll_task: asyncio.Task | None = None
 
 
 GJ_BOT_DEFINITIONS = {
     "intraday": {
         "env": "ENABLE_GJ_INTRADAY",
         "token": "TELEGRAM_GJ_INTRADAY_TOKEN",
+        "chat": "TELEGRAM_GJ_INTRADAY_CHAT_ID",
         "account": "OANDA_ACCOUNT_ID_GJ_INTRADAY",
         "risk": Decimal("0.0050"),
         "weekly_limit": 3,
@@ -703,6 +719,7 @@ GJ_BOT_DEFINITIONS = {
     "swing": {
         "env": "ENABLE_GJ_SWING",
         "token": "TELEGRAM_GJ_SWING_TOKEN",
+        "chat": "TELEGRAM_GJ_SWING_CHAT_ID",
         "account": "OANDA_ACCOUNT_ID_GJ_SWING",
         "risk": Decimal("0.0050"),
         "weekly_limit": 3,
@@ -710,6 +727,7 @@ GJ_BOT_DEFINITIONS = {
     "scalp": {
         "env": "ENABLE_GJ_SCALP",
         "token": "TELEGRAM_GJ_SCALP_TOKEN",
+        "chat": "TELEGRAM_GJ_SCALP_CHAT_ID",
         "account": "OANDA_ACCOUNT_ID_GJ_SCALP",
         "risk": Decimal("0.0025"),
         "weekly_limit": 3,
@@ -722,111 +740,139 @@ GJ_DAILY_LOSS_LIMIT = Decimal("0.0200")
 
 GJ_RISK_TIMEZONE = ZoneInfo("America/New_York")
 GJ_INSTRUMENT = "GBP_JPY"
+_SECRET_ENV_KEYS = (
+    "TELEGRAM_TOKEN",
+    "TELEGRAM_GJ_INTRADAY_TOKEN",
+    "TELEGRAM_GJ_SWING_TOKEN",
+    "TELEGRAM_GJ_SCALP_TOKEN",
+    "OANDA_API_KEY",
+    "OPENROUTER_API_KEY",
+    "CRON_SECRET",
+    "TELEGRAM_WEBHOOK_SECRET",
+)
 
 
-def _env_flag(name: str) -> bool:
+def scrub_secrets(text: str) -> str:
+    """Telegram error strings include the bot token inside the request URL."""
+    out = text or ""
+    for key in _SECRET_ENV_KEYS:
+        raw = os.getenv(key, "").strip()
+        if len(raw) >= 6:
+            out = out.replace(raw, "***")
+    return out[:300]
+
+
+def public_origin(public_url: str) -> str:
+    base = (public_url or "").strip().rstrip("/")
+    suffix = "/telegram-webhook"
+    if base.endswith(suffix):
+        base = base[: -len(suffix)]
+    return base.rstrip("/")
+
+
+def gj_webhook_url(public_url: str, key: str) -> str:
+    origin = public_origin(public_url)
+    return f"{origin}/gj/{key}/telegram-webhook" if origin else ""
+
+
+def _parse_flag(name: str) -> tuple[bool, str]:
     raw = os.getenv(name, "false").strip().lower()
-
+    if raw == "":
+        raw = "false"
     if raw not in ("true", "false", "1", "0", "yes", "no"):
-        raise RuntimeError(
-            f"{name} must be true/false"
-        )
+        return False, f"{name} must be true/false (got {raw!r})"
+    return raw in ("true", "1", "yes"), ""
 
-    return raw in ("true", "1", "yes")
+
+def _with_config_error(cfg: GJBotConfig, extra: str) -> GJBotConfig:
+    combined = "; ".join(part for part in (cfg.config_error, extra) if part)
+    return GJBotConfig(
+        key=cfg.key,
+        display_name=cfg.display_name,
+        enabled=cfg.enabled,
+        telegram_token=cfg.telegram_token,
+        telegram_chat_id=cfg.telegram_chat_id,
+        oanda_account_id=cfg.oanda_account_id,
+        risk_fraction=cfg.risk_fraction,
+        weekly_trade_limit=cfg.weekly_trade_limit,
+        config_error=combined,
+        oanda_base=cfg.oanda_base,
+    )
 
 
 def load_gj_bot_configs() -> dict[str, GJBotConfig]:
-    """
-    Load the three independent GBPJPY bot configurations.
-
-    Missing credentials are permitted while a bot is disabled.
-    If a bot is enabled, its Telegram token and account ID
-    must both be present.
-    """
-
+    """Load the three GBPJPY bots. A bad flag or missing secret marks that bot; it does not stop the others."""
     configs: dict[str, GJBotConfig] = {}
-
+    shared_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     for key, definition in GJ_BOT_DEFINITIONS.items():
-
-        enabled = _env_flag(definition["env"])
-
-        token = os.getenv(
-            definition["token"], ""
-        ).strip()
-
-        account_id = os.getenv(
-            definition["account"], ""
-        ).strip()
-
-        if enabled and (not token or not account_id):
-            raise RuntimeError(
-                f"{definition['env']} is true but "
-                f"{definition['token']} or "
-                f"{definition['account']} is missing"
-            )
-
+        enabled, flag_error = _parse_flag(definition["env"])
+        token = os.getenv(definition["token"], "").strip()
+        account_id = os.getenv(definition["account"], "").strip()
+        chat_id = os.getenv(definition["chat"], "").strip() or shared_chat
+        problems: list[str] = []
+        if flag_error:
+            problems.append(flag_error)
+            enabled = False
+        if enabled and not token:
+            problems.append(f"{definition['token']} is required because {definition['env']} is true")
+        if enabled and not account_id:
+            problems.append(f"{definition['account']} is required because {definition['env']} is true")
         configs[key] = GJBotConfig(
             key=key,
             display_name=f"GBPJPY {key.title()}",
             enabled=enabled,
             telegram_token=token,
+            telegram_chat_id=chat_id,
             oanda_account_id=account_id,
             risk_fraction=definition["risk"],
             weekly_trade_limit=definition["weekly_limit"],
+            config_error="; ".join(problems),
         )
 
-    # Each enabled bot must have its own OANDA Practice account.
-    active_accounts = [
-        cfg.oanda_account_id
-        for cfg in configs.values()
-        if cfg.enabled
-    ]
-
-    if len(active_accounts) != len(set(active_accounts)):
-        raise RuntimeError(
-            "Enabled GBPJPY bots must use distinct "
-            "OANDA Practice account IDs"
-        )
-
+    main_token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    by_token: dict[str, list[str]] = {}
+    by_account: dict[str, list[str]] = {}
+    for cfg in configs.values():
+        if cfg.telegram_token:
+            by_token.setdefault(cfg.telegram_token, []).append(cfg.key)
+        if cfg.enabled and cfg.oanda_account_id:
+            by_account.setdefault(cfg.oanda_account_id, []).append(cfg.key)
+    for token, keys in by_token.items():
+        if len(keys) > 1:
+            for key in keys:
+                configs[key] = _with_config_error(configs[key], "Telegram token is shared with another GJ bot")
+        elif token and token == main_token:
+            key = keys[0]
+            configs[key] = _with_config_error(configs[key], "Telegram token is the same as TELEGRAM_TOKEN; create a separate bot")
+    for keys in by_account.values():
+        if len(keys) > 1:
+            for key in keys:
+                configs[key] = _with_config_error(
+                    configs[key], "Enabled GBPJPY bots must use distinct OANDA Practice account IDs"
+                )
     return configs
 
 
-def gj_foundation_status(
-    configs: dict[str, GJBotConfig]
-) -> dict[str, Any]:
-    """
-    Configuration-only status.
-    Does not contact OANDA or Telegram.
-    """
-
+def gj_foundation_status(configs: dict[str, GJBotConfig]) -> dict[str, Any]:
+    """Configuration snapshot. Does not include tokens or account ids."""
     return {
         "instrument": GJ_INSTRUMENT,
         "broker_environment": "practice",
         "order_execution": "not_implemented",
         "portfolio_risk_gate": "not_implemented_fail_closed",
-        "open_risk_limit": str(
-            GJ_PORTFOLIO_OPEN_RISK_LIMIT
-        ),
-        "daily_loss_limit": str(
-            GJ_DAILY_LOSS_LIMIT
-        ),
+        "open_risk_limit": str(GJ_PORTFOLIO_OPEN_RISK_LIMIT),
+        "daily_loss_limit": str(GJ_DAILY_LOSS_LIMIT),
         "daily_reset_timezone": "America/New_York",
         "bots": {
             key: {
                 "name": cfg.display_name,
                 "enabled": cfg.enabled,
-                "account_configured": bool(
-                    cfg.oanda_account_id
-                ),
-                "telegram_configured": bool(
-                    cfg.telegram_token
-                ),
-                "risk_fraction": str(
-                    cfg.risk_fraction
-                ),
-                "weekly_trade_limit": (
-                    cfg.weekly_trade_limit
-                ),
+                "account_configured": bool(cfg.oanda_account_id),
+                "telegram_configured": bool(cfg.telegram_token),
+                "chat_configured": bool(cfg.telegram_chat_id),
+                "config_error": cfg.config_error,
+                "risk_fraction": str(cfg.risk_fraction),
+                "weekly_trade_limit": cfg.weekly_trade_limit,
                 "broker_environment": "practice",
             }
             for key, cfg in configs.items()
@@ -834,43 +880,383 @@ def gj_foundation_status(
         "legacy_ema_shared_risk_enforcement": False,
     }
 
+
+def gj_public_status() -> dict[str, Any]:
+    if getattr(app.state, "gj_config_error", "") and not getattr(app.state, "gj_configs", None):
+        return {"error": app.state.gj_config_error}
+    configs = getattr(app.state, "gj_configs", None) or {}
+    if not configs:
+        try:
+            configs = load_gj_bot_configs()
+        except Exception as exc:
+            return {"error": scrub_secrets(str(exc))}
+    payload = gj_foundation_status(configs)
+    runtimes = getattr(app.state, "gj_bots", None) or {}
+    for key, info in payload["bots"].items():
+        rt = runtimes.get(key)
+        info["telegram"] = "offline"
+        info["username"] = ""
+        if rt is not None:
+            info["telegram"] = rt.mode
+            info["username"] = rt.username
+            if rt.last_error:
+                info["telegram_error"] = rt.last_error
+    return payload
+
+
+def format_gj_report() -> str:
+    status = gj_public_status()
+    if "bots" not in status:
+        return "GJ bots: " + status.get("error", "not loaded")
+    lines = ["GBPJPY bots (OANDA practice, no orders are sent):"]
+    for info in status["bots"].values():
+        who = f" @{info['username']}" if info.get("username") else ""
+        line = f"{info['name']}{who}: Telegram {info.get('telegram', 'offline')}"
+        if not info.get("telegram_configured"):
+            line += ", token missing"
+        if info.get("config_error"):
+            line += f"\n  {info['config_error']}"
+        if info.get("telegram_error"):
+            line += f"\n  {info['telegram_error']}"
+        lines.append(line)
+    lines.append("Message each bot and send /start. From this bot, /gj shows this again.")
+    return "\n".join(lines)
+
+
+def make_bot(token: str) -> Bot:
+    """Long polling needs a read timeout longer than Telegram's poll window."""
+    try:
+        from telegram.request import HTTPXRequest
+
+        request = HTTPXRequest(connect_timeout=10.0, read_timeout=30.0, write_timeout=10.0, pool_timeout=5.0)
+        return Bot(token=token, request=request)
+    except Exception as exc:
+        logger.warning("Using default Telegram client: %s", exc.__class__.__name__)
+        return Bot(token=token)
+
+
+def webhook_secret_from_env() -> str:
+    settings = getattr(app.state, "settings", None)
+    secret = settings.webhook_secret if settings is not None else os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if secret and not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+        return ""
+    return secret
+
+
+def webhook_secret_ok(request: Request, secret: str) -> bool:
+    if not secret:
+        return True
+    received = request.headers.get("x-telegram-bot-api-secret-token", "")
+    return bool(hmac.compare_digest(received, secret))
+
+
+async def bind_telegram(bot: Bot, hook_url: str, secret: str) -> tuple[str, str]:
+    """Register an https webhook, or fall back to polling so the bot still replies."""
+    try:
+        await bot.initialize()
+    except Exception as exc:
+        return "offline", scrub_secrets(_short_error(exc))
+    webhook_error = ""
+    if hook_url.startswith("https://"):
+        try:
+            kwargs: dict[str, Any] = {"allowed_updates": ["message"]}
+            if secret:
+                kwargs["secret_token"] = secret
+            await bot.set_webhook(url=hook_url, **kwargs)
+            return "webhook", ""
+        except Exception as exc:
+            webhook_error = scrub_secrets(_short_error(exc))
+            logger.warning("Webhook rejected (%s); falling back to polling", webhook_error)
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as exc:
+        return "offline", scrub_secrets(_short_error(exc))
+    if webhook_error:
+        return "polling", f"Webhook failed ({webhook_error}). Using polling instead."
+    return "polling", ""
+
+
+async def poll_loop(bot: Bot, seen: OrderedDict, on_update) -> None:
+    offset = None
+    while True:
+        try:
+            updates = await bot.get_updates(offset=offset, timeout=20, allowed_updates=["message"])
+            for update in updates:
+                offset = update.update_id + 1
+                data = update.to_dict()
+                if remember_update(seen, data.get("update_id")):
+                    continue
+                try:
+                    await on_update(data)
+                except Exception:
+                    logger.exception("Telegram update handler failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if exc.__class__.__name__ in {"TimedOut", "NetworkError"}:
+                continue
+            logger.warning("Telegram poll error: %s", scrub_secrets(_short_error(exc)))
+            await asyncio.sleep(5)
+
+
+def gj_practice_summary(api_key: str, account_id: str) -> str:
+    """Read-only practice balance. Never calls the live OANDA host and never places an order."""
+    tail = account_id[-4:] if account_id else "????"
+    if not api_key:
+        return f"Practice account …{tail}: OANDA_API_KEY is missing, so the balance cannot be read."
+    url = f"https://api-fxpractice.oanda.com/v3/accounts/{quote(account_id, safe='')}/summary"
+    try:
+        response = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
+    except Exception as exc:
+        return f"Practice account …{tail}: request failed ({scrub_secrets(_short_error(exc))})"
+    if response.status_code >= 400:
+        return f"Practice account …{tail}: OANDA HTTP {response.status_code}: {scrub_secrets(response.text[:180])}"
+    account = (response.json() or {}).get("account") or {}
+    return (
+        f"Practice account …{tail}\n"
+        f"Balance: {account.get('balance', 'N/A')}\n"
+        f"Unrealized: {account.get('unrealizedPL', 'N/A')}\n"
+        f"Open trades: {account.get('openTradeCount', 0)}"
+    )
+
+
+async def gj_say(key: str, text: str, chat_id: str | None = None) -> bool:
+    runtime = app.state.gj_bots.get(key) if getattr(app.state, "gj_bots", None) else None
+    if runtime is None or runtime.bot is None:
+        return False
+    target = chat_id or runtime.config.telegram_chat_id
+    if not target:
+        return False
+    sent = False
+    for part in chunk_text(text):
+        try:
+            await runtime.bot.send_message(chat_id=target, text=part)
+            sent = True
+        except Exception as exc:
+            runtime.last_error = scrub_secrets(_short_error(exc))
+            logger.warning("GJ %s send failed: %s", key, runtime.last_error)
+            return False
+        await asyncio.sleep(0.3)
+    return sent
+
+
+def gj_help(key: str) -> str:
+    definition = GJ_BOT_DEFINITIONS[key]
+    cfg = app.state.gj_bots[key].config
+    return (
+        f"{cfg.display_name}\n\n"
+        "This bot replies here and can read its OANDA practice account. It does not place orders.\n\n"
+        "/status - connection, flags, practice balance\n"
+        "/ping - check that this process can reply\n"
+        "/id - this chat's id\n\n"
+        f"Token env: {definition['token']}\n"
+        f"Chat env: {definition['chat']} (falls back to TELEGRAM_CHAT_ID)\n"
+        f"Account env: {definition['account']}\n"
+        f"Trading flag: {definition['env']} (still does not send orders)"
+    )
+
+
+async def handle_gj_command(key: str, cmd: str) -> None:
+    runtime = app.state.gj_bots[key]
+    cfg = runtime.config
+    definition = GJ_BOT_DEFINITIONS[key]
+    try:
+        if cmd in ("/start", "/help"):
+            await gj_say(key, gj_help(key))
+        elif cmd == "/ping":
+            await gj_say(key, f"pong ({runtime.mode})")
+        elif cmd == "/id":
+            await gj_say(key, f"This chat's ID is: {cfg.telegram_chat_id or 'not locked'}")
+        elif cmd == "/status":
+            lines = [
+                cfg.display_name + (f" (@{runtime.username})" if runtime.username else ""),
+                f"Telegram: {runtime.mode}",
+                f"Trading flag {definition['env']}: {'ON' if cfg.enabled else 'OFF'}",
+                "Orders: none. Execution is not turned on; this bot will not buy or sell.",
+                f"Risk budget: {cfg.risk_fraction:.2%} of equity | weekly cap: {cfg.weekly_trade_limit} (not enforced yet)",
+                f"Chat lock: {cfg.telegram_chat_id or 'NOT SET — set ' + definition['chat']}",
+            ]
+            if cfg.config_error:
+                lines.append("Config: " + cfg.config_error)
+            if runtime.last_error:
+                lines.append("Note: " + runtime.last_error)
+            if cfg.oanda_account_id:
+                summary = await asyncio.to_thread(
+                    gj_practice_summary, os.getenv("OANDA_API_KEY", "").strip(), cfg.oanda_account_id
+                )
+                lines.append(summary)
+            else:
+                lines.append(f"Account: set {definition['account']}")
+            await gj_say(key, "\n".join(lines))
+        else:
+            await gj_say(key, f"Unknown command: {cmd}\nSend /help")
+    except Exception as exc:
+        logger.exception("GJ %s command failed", key)
+        await gj_say(key, "Error: " + scrub_secrets(_short_error(exc)))
+
+
+async def handle_gj_update(key: str, data: dict) -> None:
+    runtime = app.state.gj_bots.get(key) if getattr(app.state, "gj_bots", None) else None
+    if runtime is None or runtime.bot is None:
+        return
+    msg = data.get("message")
+    if not isinstance(msg, dict) or "text" not in msg:
+        return
+    sender = str((msg.get("chat") or {}).get("id"))
+    text = str(msg.get("text") or "")
+    cmd = parse_command(text)
+    allowed = runtime.config.telegram_chat_id
+    if allowed and sender != allowed:
+        logger.warning("GJ %s rejected chat %s", key, sender)
+        if cmd.startswith("/"):
+            chat_env = GJ_BOT_DEFINITIONS[key]["chat"]
+            await gj_say(
+                key,
+                f"This chat's ID is: {sender}\nThis bot only answers {allowed}.\n"
+                f"To use this chat, set {chat_env} to {sender} and redeploy.",
+                chat_id=sender,
+            )
+        return
+    if cmd == "/id":
+        await gj_say(key, f"This chat's ID is: {sender}", chat_id=sender)
+        if not allowed:
+            await gj_say(
+                key,
+                f"Chat is not locked yet. Set {GJ_BOT_DEFINITIONS[key]['chat']}={sender} "
+                "(or TELEGRAM_CHAT_ID) so nobody else can use this bot.",
+                chat_id=sender,
+            )
+        return
+    await handle_gj_command(key, cmd)
+
+
+async def start_gj_bots() -> None:
+    try:
+        configs = load_gj_bot_configs()
+    except Exception as exc:
+        app.state.gj_config_error = scrub_secrets(str(exc))
+        app.state.gj_configs = {}
+        app.state.gj_bots = {}
+        logger.exception("GJ config load failed")
+        return
+    app.state.gj_configs = configs
+    app.state.gj_bots = {}
+    public_url = os.getenv("PUBLIC_URL", "").strip()
+    settings = app.state.settings
+    if settings is not None and settings.public_url:
+        public_url = settings.public_url
+    secret = webhook_secret_from_env()
+    for key, cfg in configs.items():
+        runtime = GJRuntime(config=cfg)
+        app.state.gj_bots[key] = runtime
+        if cfg.config_error:
+            logger.error("GJ %s config: %s", key, cfg.config_error)
+        if not cfg.telegram_token:
+            runtime.last_error = f"Set {GJ_BOT_DEFINITIONS[key]['token']} so this bot can reply on Telegram."
+            logger.warning("GJ %s has no Telegram token", key)
+            continue
+        bot = make_bot(cfg.telegram_token)
+        runtime.bot = bot
+        try:
+            mode, note = await bind_telegram(bot, gj_webhook_url(public_url, key), secret)
+            runtime.mode = mode
+            if note:
+                runtime.last_error = note
+            if mode == "offline":
+                logger.error("GJ %s Telegram offline: %s", key, note)
+                continue
+            try:
+                me = await bot.get_me()
+                runtime.username = getattr(me, "username", "") or ""
+            except Exception as exc:
+                runtime.last_error = scrub_secrets(_short_error(exc))
+                logger.warning("GJ %s get_me failed: %s", key, runtime.last_error)
+            logger.info("GJ %s Telegram %s as @%s", key, mode, runtime.username)
+            if mode == "polling":
+                runtime.poll_task = asyncio.create_task(poll_loop(bot, runtime.seen, lambda data, key=key: handle_gj_update(key, data)))
+            if cfg.telegram_chat_id:
+                await gj_say(key, f"{cfg.display_name} is online ({mode}).\nSend /status")
+        except Exception as exc:
+            runtime.mode = "offline"
+            runtime.last_error = scrub_secrets(_short_error(exc))
+            logger.exception("GJ %s Telegram setup failed", key)
+
+
+async def stop_gj_bots() -> None:
+    runtimes = list((getattr(app.state, "gj_bots", None) or {}).values())
+    tasks = [runtime.poll_task for runtime in runtimes if runtime.poll_task is not None]
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("GJ poll task shutdown failed")
+    for runtime in runtimes:
+        if runtime.bot is not None:
+            try:
+                await runtime.bot.shutdown()
+            except Exception:
+                logger.exception("GJ %s shutdown failed", runtime.config.key)
+
 # ---------- app ----------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The legacy bot and the three GJ bots start independently. A missing
+    # OpenRouter key must not silence the GJ bots, and a bad GJ token must
+    # not stop the legacy bot.
+    tasks: list[asyncio.Task] = []
+    settings = None
     try:
         settings = load_settings()
     except RuntimeError as exc:
         logger.error("Configuration error: %s", exc)
-        yield
-        return
-    bot = Bot(token=settings.telegram_token)
-    broker = OandaBroker(settings)
-    ai_client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=settings.openrouter_api_key, timeout=30)
-    app.state.settings = settings
-    app.state.bot = bot
-    app.state.broker = broker
-    app.state.ai_client = ai_client
-    app.state.opinion_fn = lambda pair, signal: get_openrouter_opinion(ai_client, settings.openrouter_model, pair, signal)
-
-    await bot.initialize()
-    if settings.public_url:
+    if settings is not None:
+        bot = make_bot(settings.telegram_token)
+        broker = OandaBroker(settings)
+        ai_client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=settings.openrouter_api_key, timeout=30)
+        app.state.settings = settings
+        app.state.bot = bot
+        app.state.broker = broker
+        app.state.ai_client = ai_client
+        app.state.opinion_fn = lambda pair, signal: get_openrouter_opinion(ai_client, settings.openrouter_model, pair, signal)
         try:
-            kwargs: dict[str, Any] = {"allowed_updates": ["message"]}
-            if settings.webhook_secret:
-                kwargs["secret_token"] = settings.webhook_secret
-            await bot.set_webhook(url=webhook_url(settings.public_url), **kwargs)
+            mode, note = await bind_telegram(
+                bot,
+                webhook_url(settings.public_url) if settings.public_url else "",
+                settings.webhook_secret,
+            )
+            app.state.main_telegram_mode = mode
+            if note:
+                logger.warning("Main Telegram: %s", note)
+            if mode == "polling":
+                tasks.append(asyncio.create_task(poll_loop(bot, app.state.seen_updates, dispatch_main_update)))
+            elif mode == "offline":
+                logger.error("Main Telegram offline: %s", note)
         except Exception:
-            logger.exception("Failed to set webhook")
-    else:
-        logger.warning("PUBLIC_URL is not set: Telegram webhook NOT registered")
-
-    tasks = [asyncio.create_task(scan_loop()), asyncio.create_task(housekeeping_loop())]
-    yield
-    for task in tasks:
-        task.cancel()
-    await bot.shutdown()
-    broker.close()
+            logger.exception("Main Telegram setup failed")
+        tasks.append(asyncio.create_task(scan_loop()))
+        tasks.append(asyncio.create_task(housekeeping_loop()))
+    try:
+        await start_gj_bots()
+    except Exception:
+        logger.exception("GJ Telegram setup failed")
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        if app.state.bot is not None:
+            try:
+                await app.state.bot.shutdown()
+            except Exception:
+                logger.exception("Main Telegram shutdown failed")
+        if app.state.broker is not None:
+            app.state.broker.close()
+        await stop_gj_bots()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -885,6 +1271,10 @@ app.state.seen_updates = OrderedDict()
 app.state.tasks = set()
 app.state.entered_bar = {}
 app.state.loss_alert_day = None
+app.state.main_telegram_mode = "offline"
+app.state.gj_configs = {}
+app.state.gj_bots = {}
+app.state.gj_config_error = ""
 
 
 async def say(text: str, chat_id: str | None = None) -> None:
@@ -983,7 +1373,9 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
                 "/stats [days] - win rate, avg win/loss, P/L by day\n"
                 "/today - today's P/L\n"
                 "/instruments [filter] - tradable instruments\n"
-                "/ai - test OpenRouter connection"
+                "/ai - test OpenRouter connection\n"
+                "/gj - whether the 3 GBPJPY Telegram bots are online\n"
+                "/id - this chat's id"
             )
         elif cmd == "/status":
             bal, pnl, count = await asyncio.to_thread(app.state.broker.account_summary)
@@ -1038,6 +1430,10 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
             if failed:
                 lines += ["FAILED:"] + failed
             await say("\n".join(lines))
+        elif cmd == "/gj":
+            await say(format_gj_report())
+        elif cmd == "/id":
+            await say(f"This chat's ID is: {app.state.settings.telegram_chat_id}")
         elif cmd == "/ai":
             client = app.state.ai_client
             if client is None:
@@ -1060,27 +1456,26 @@ async def handle_command(cmd: str, args: list[str] | None = None) -> None:
 
 @app.get("/")
 def home():
-    return {"status": "Active", "configured": app.state.settings is not None}
+    return {
+        "status": "Active",
+        "configured": app.state.settings is not None,
+        "telegram": app.state.main_telegram_mode,
+        "gj": gj_public_status(),
+    }
 
 
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
+@app.get("/gj/status")
+def gj_status():
+    return gj_public_status()
+
+
+async def dispatch_main_update(data: dict) -> str:
     settings = app.state.settings
-    if not settings:
-        return {"status": "not configured"}
-    if settings.webhook_secret:
-        received = request.headers.get("x-telegram-bot-api-secret-token", "")
-        if not hmac.compare_digest(received, settings.webhook_secret):
-            return {"status": "unauthorized"}
-    try:
-        data = await request.json()
-    except Exception:
-        return {"status": "bad json"}
-    if remember_update(app.state.seen_updates, data.get("update_id")):
-        return {"status": "duplicate"}
+    if not settings or app.state.bot is None:
+        return "not configured"
     msg = data.get("message")
     if not isinstance(msg, dict) or "text" not in msg:
-        return {"status": "ignored"}
+        return "ignored"
     sender_chat_id = str((msg.get("chat") or {}).get("id"))
     text = str(msg.get("text") or "")
     cmd = parse_command(text)
@@ -1088,8 +1483,45 @@ async def telegram_webhook(request: Request):
         logger.warning("UNAUTHORIZED chat rejected: %s", sender_chat_id)
         if cmd == "/id":
             await say(f"This chat's ID is: {sender_chat_id}", chat_id=sender_chat_id)
-        return {"status": "unauthorized"}
+        return "unauthorized"
     task = asyncio.create_task(handle_command(cmd, parse_args(text)))
+    app.state.tasks.add(task)
+    task.add_done_callback(app.state.tasks.discard)
+    return "ok"
+
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    settings = app.state.settings
+    if not settings:
+        return {"status": "not configured"}
+    if not webhook_secret_ok(request, settings.webhook_secret):
+        return {"status": "unauthorized"}
+    try:
+        data = await request.json()
+    except Exception:
+        return {"status": "bad json"}
+    if remember_update(app.state.seen_updates, data.get("update_id")):
+        return {"status": "duplicate"}
+    return {"status": await dispatch_main_update(data)}
+
+
+@app.post("/gj/{bot_key}/telegram-webhook")
+async def gj_telegram_webhook(bot_key: str, request: Request):
+    if bot_key not in GJ_BOT_DEFINITIONS:
+        return {"status": "unknown bot"}
+    if not webhook_secret_ok(request, webhook_secret_from_env()):
+        return {"status": "unauthorized"}
+    runtime = app.state.gj_bots.get(bot_key) if app.state.gj_bots else None
+    if runtime is None or runtime.bot is None:
+        return {"status": "offline"}
+    try:
+        data = await request.json()
+    except Exception:
+        return {"status": "bad json"}
+    if remember_update(runtime.seen, data.get("update_id")):
+        return {"status": "duplicate"}
+    task = asyncio.create_task(handle_gj_update(bot_key, data))
     app.state.tasks.add(task)
     task.add_done_callback(app.state.tasks.discard)
     return {"status": "ok"}
