@@ -676,6 +676,164 @@ def check_pair_text(broker: OandaBroker, name: str) -> str:
     return "\n".join(lines)
 
 
+# ---------- GBPJPY MULTI-BOT FOUNDATION ----------
+# Practice-only configuration. All bots remain disabled by default.
+# This section does not submit orders or modify the legacy EMA strategy.
+
+@dataclass(frozen=True)
+class GJBotConfig:
+    key: str
+    display_name: str
+    enabled: bool
+    telegram_token: str
+    oanda_account_id: str
+    risk_fraction: Decimal
+    weekly_trade_limit: int
+    oanda_base: str = "https://api-fxpractice.oanda.com/v3"
+
+
+GJ_BOT_DEFINITIONS = {
+    "intraday": {
+        "env": "ENABLE_GJ_INTRADAY",
+        "token": "TELEGRAM_GJ_INTRADAY_TOKEN",
+        "account": "OANDA_ACCOUNT_ID_GJ_INTRADAY",
+        "risk": Decimal("0.0050"),
+        "weekly_limit": 3,
+    },
+    "swing": {
+        "env": "ENABLE_GJ_SWING",
+        "token": "TELEGRAM_GJ_SWING_TOKEN",
+        "account": "OANDA_ACCOUNT_ID_GJ_SWING",
+        "risk": Decimal("0.0050"),
+        "weekly_limit": 3,
+    },
+    "scalp": {
+        "env": "ENABLE_GJ_SCALP",
+        "token": "TELEGRAM_GJ_SCALP_TOKEN",
+        "account": "OANDA_ACCOUNT_ID_GJ_SCALP",
+        "risk": Decimal("0.0025"),
+        "weekly_limit": 3,
+    },
+}
+
+# Portfolio-wide limits agreed for the GBPJPY system.
+GJ_PORTFOLIO_OPEN_RISK_LIMIT = Decimal("0.0100")
+GJ_DAILY_LOSS_LIMIT = Decimal("0.0200")
+
+GJ_RISK_TIMEZONE = ZoneInfo("America/New_York")
+GJ_INSTRUMENT = "GBP_JPY"
+
+
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name, "false").strip().lower()
+
+    if raw not in ("true", "false", "1", "0", "yes", "no"):
+        raise RuntimeError(
+            f"{name} must be true/false"
+        )
+
+    return raw in ("true", "1", "yes")
+
+
+def load_gj_bot_configs() -> dict[str, GJBotConfig]:
+    """
+    Load the three independent GBPJPY bot configurations.
+
+    Missing credentials are permitted while a bot is disabled.
+    If a bot is enabled, its Telegram token and account ID
+    must both be present.
+    """
+
+    configs: dict[str, GJBotConfig] = {}
+
+    for key, definition in GJ_BOT_DEFINITIONS.items():
+
+        enabled = _env_flag(definition["env"])
+
+        token = os.getenv(
+            definition["token"], ""
+        ).strip()
+
+        account_id = os.getenv(
+            definition["account"], ""
+        ).strip()
+
+        if enabled and (not token or not account_id):
+            raise RuntimeError(
+                f"{definition['env']} is true but "
+                f"{definition['token']} or "
+                f"{definition['account']} is missing"
+            )
+
+        configs[key] = GJBotConfig(
+            key=key,
+            display_name=f"GBPJPY {key.title()}",
+            enabled=enabled,
+            telegram_token=token,
+            oanda_account_id=account_id,
+            risk_fraction=definition["risk"],
+            weekly_trade_limit=definition["weekly_limit"],
+        )
+
+    # Each enabled bot must have its own OANDA Practice account.
+    active_accounts = [
+        cfg.oanda_account_id
+        for cfg in configs.values()
+        if cfg.enabled
+    ]
+
+    if len(active_accounts) != len(set(active_accounts)):
+        raise RuntimeError(
+            "Enabled GBPJPY bots must use distinct "
+            "OANDA Practice account IDs"
+        )
+
+    return configs
+
+
+def gj_foundation_status(
+    configs: dict[str, GJBotConfig]
+) -> dict[str, Any]:
+    """
+    Configuration-only status.
+    Does not contact OANDA or Telegram.
+    """
+
+    return {
+        "instrument": GJ_INSTRUMENT,
+        "broker_environment": "practice",
+        "order_execution": "not_implemented",
+        "portfolio_risk_gate": "not_implemented_fail_closed",
+        "open_risk_limit": str(
+            GJ_PORTFOLIO_OPEN_RISK_LIMIT
+        ),
+        "daily_loss_limit": str(
+            GJ_DAILY_LOSS_LIMIT
+        ),
+        "daily_reset_timezone": "America/New_York",
+        "bots": {
+            key: {
+                "name": cfg.display_name,
+                "enabled": cfg.enabled,
+                "account_configured": bool(
+                    cfg.oanda_account_id
+                ),
+                "telegram_configured": bool(
+                    cfg.telegram_token
+                ),
+                "risk_fraction": str(
+                    cfg.risk_fraction
+                ),
+                "weekly_trade_limit": (
+                    cfg.weekly_trade_limit
+                ),
+                "broker_environment": "practice",
+            }
+            for key, cfg in configs.items()
+        },
+        "legacy_ema_shared_risk_enforcement": False,
+    }
+
 # ---------- app ----------
 
 @asynccontextmanager
